@@ -20,10 +20,12 @@ client = OpenAI(api_key=api_key, base_url=base_url)
 
 CALENDAR_ID = 'dominio3004@gmail.com'
 
-# === MEMÓRIA DO CHAT ===
-# Guarda o histórico de conversas por número de telefone
-user_memories = {}
+# === MEMÓRIA DO CHAT (Substituindo o st.session_state) ===
+user_memories = {}      # Guarda o histórico da conversa
+user_names = {}         # Guarda o nome do cliente
+user_last_events = {}   # Guarda o ID do evento para permitir reagendamento
 
+# --- Funções Auxiliares ---
 def checar_disponibilidade(data_inicio, duracao=30):
     data_fim = data_inicio + timedelta(minutes=duracao)
     service = get_calendar_service()
@@ -54,9 +56,9 @@ def enviar_whatsapp(numero_destino, texto_mensagem):
     
     try:
         response = requests.post(url, json=payload, headers=headers)
-        print(f"Status Envio: {response.status_code}")
+        print(f"Status Evolução: {response.status_code}")
         if response.status_code not in [200, 201]:
-            print(f"RESPOSTA DE ERRO: {response.text}")
+            print(f"RESPOSTA DE ERRO DA EVOLUÇÃO: {response.text}")
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
@@ -70,6 +72,7 @@ async def receber_webhook(request: Request):
             remote_jid = message_data["key"]["remoteJid"]
             numero_usuario = remote_jid.split("@")[0]
             
+            # Ignora as próprias mensagens do bot
             if message_data["key"].get("fromMe"): 
                 return {"status": "ok"}
 
@@ -79,35 +82,42 @@ async def receber_webhook(request: Request):
 
             print(f"Mensagem de {numero_usuario}: {texto_recebido}")
 
-            # === RECUPERANDO MEMÓRIA ===
+            # Inicializa a memória se for o primeiro contato
             if numero_usuario not in user_memories:
                 user_memories[numero_usuario] = []
+                user_names[numero_usuario] = None
 
             agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            nome_atual = user_names.get(numero_usuario) or "Não identificado"
             
+            # --- SYSTEM PROMPT IDÊNTICO AO DO STREAMLIT ---
             system_prompt = f"""
             Você é a Sofia, recepcionista da Barbearia do João. Você é educada, humana e profissional.
             Data/Hora atual: {agora}.
+            Nome do cliente: {nome_atual}
             Serviços: Corte Simples (30min, R$30), Corte+Barba (45min, R$50), Barba (20min, R$20).
             
             REGRAS IMPORTANTES (Responda SEMPRE em formato JSON):
-            1. Se você ainda não sabe o nome do cliente, pergunte de forma educada ANTES de prosseguir.
+            1. Se o nome for "Não identificado", pergunte o nome de forma educada ANTES de prosseguir.
             2. Se o cliente informar o nome, retorne: 
-            {{"acao": "informar_nome", "nome": "Nome", "resposta": "Sua saudação"}}
-            3. Se o cliente perguntar por um horário, retorne:
-            {{"acao": "verificar_horario", "horario": "AAAA-MM-DDTHH:MM", "servico": "nome do serviço", "nome": "nome do cliente se ele disse"}}
-            4. Para dúvidas ou conversas, retorne:
+            {{"acao": "informar_nome", "nome": "Nome", "resposta": "Sua saudação usando o histórico para continuar o assunto"}}
+            3. Se o cliente perguntar por um horário (ex: "tem 14h?"), retorne:
+            {{"acao": "verificar_horario", "horario": "AAAA-MM-DDTHH:MM", "servico": "nome do serviço se ele citou, senão deixe nulo"}}
+            4. Se o cliente pedir para mudar um agendamento feito, retorne:
+            {{"acao": "reagendar", "horario_novo": "AAAA-MM-DDTHH:MM", "servico": "nome"}}
+            5. Para dúvidas ou conversas, retorne:
             {{"acao": "duvida", "resposta": "Sua resposta"}}
-            
-            NUNCA use o formato AAAA-MM-DDTHH:MM na resposta para o cliente, apenas no JSON interno.
+            6. O formato AAAA-MM-DDTHH:MM é de uso INTERNO do sistema. NUNCA peça nem mencione esse formato ao cliente.
+               Fale sempre de forma natural e simpática, como uma recepcionista de verdade
+               (ex: "Qual dia e horário ficam melhores para você?").
+               Se o cliente disser "amanhã às 14h", "sexta de manhã" etc., converta você mesma para a data correta usando a Data/Hora atual.
+            7. Se o cliente já escolheu o serviço mas ainda não disse dia e horário, use "acao": "duvida" e pergunte de forma natural qual dia e horário ele prefere.
             """
 
-            # Monta o histórico para enviar para a IA
             messages_for_api = [{"role": "system", "content": system_prompt}]
             for msg in user_memories[numero_usuario]:
                 messages_for_api.append(msg)
             
-            # Adiciona a nova mensagem do usuário no histórico
             user_memories[numero_usuario].append({"role": "user", "content": texto_recebido})
             messages_for_api.append({"role": "user", "content": texto_recebido})
 
@@ -116,32 +126,70 @@ async def receber_webhook(request: Request):
                 messages=messages_for_api, 
                 response_format={"type": "json_object"}
             )
+            
             resposta_ia_raw = response.choices[0].message.content
             intencao = json.loads(resposta_ia_raw)
             
-            # Salva a resposta da IA no histórico (para ela lembrar do que ela mesma disse)
+            # Salva a resposta no histórico para manter a memória
             user_memories[numero_usuario].append({"role": "assistant", "content": resposta_ia_raw})
 
-            acao = intencao.get("acao")
             resposta_final = ""
+            acao = intencao.get("acao")
 
             if acao == "informar_nome":
-                resposta_final = intencao.get("resposta")
-                # O nome fica salvo no histórico para as próximas mensagens
+                user_names[numero_usuario] = intencao["nome"]
+                resposta_final = intencao.get("resposta", f"Prazer em te conhecer, {intencao['nome']}! Como posso ajudar?")
+
             elif acao == "verificar_horario":
                 data_inicio = datetime.fromisoformat(intencao["horario"])
-                servico = intencao.get("servico", "Corte Simples")
-                nome = intencao.get("nome", "Cliente")
+                servico = intencao.get("servico")
                 
                 if checar_disponibilidade(data_inicio):
-                    duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                    criar_evento(nome, servico, data_inicio, duracao)
-                    resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
+                    if servico:
+                        if not user_names.get(numero_usuario):
+                            resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')}. Só me diga seu nome para eu confirmar o agendamento."
+                        else:
+                            duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
+                            evento_id = criar_evento(user_names[numero_usuario], servico, data_inicio, duracao)
+                            user_last_events[numero_usuario] = evento_id  # Salva o ID para reagendar
+                            resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
+                    else:
+                        resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')} do dia {data_inicio.strftime('%d/%m')}. Qual serviço deseja?"
                 else:
-                    resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado."
+                    resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado. Gostaria de tentar outro horário?"
+
+            elif acao == "reagendar":
+                if not user_names.get(numero_usuario):
+                    resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
+                else:
+                    dt_novo = datetime.fromisoformat(intencao["horario_novo"])
+                    servico = intencao["servico"]
+                    duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
+
+                    service = get_calendar_service()
+                    deletou = False
+                    
+                    if user_last_events.get(numero_usuario):
+                        try:
+                            service.events().delete(calendarId=CALENDAR_ID, eventId=user_last_events[numero_usuario]).execute()
+                            user_last_events[numero_usuario] = None
+                            deletou = True
+                        except Exception:
+                            pass
+
+                    if not deletou:
+                        resposta_final = "Não localizei seu agendamento anterior. Vamos fazer um novo?"
+                    else:
+                        if checar_disponibilidade(dt_novo, duracao):
+                            evento_id = criar_evento(user_names[numero_usuario], servico, dt_novo, duracao)
+                            user_last_events[numero_usuario] = evento_id
+                            resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi reagendado para {dt_novo.strftime('%d/%m às %H:%M')}."
+                        else:
+                            resposta_final = f"❌ Infelizmente, o horário das {dt_novo.strftime('%H:%M')} está ocupado. O antigo foi cancelado, qual outro horário fica bom?"
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
+            # Envia a resposta para o WhatsApp
             enviar_whatsapp(numero_usuario, resposta_final)
 
         except Exception as e:
