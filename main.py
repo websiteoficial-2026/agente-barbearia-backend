@@ -51,10 +51,21 @@ def enviar_whatsapp(numero_destino, texto_mensagem):
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
     payload = {"number": numero_destino, "textMessage": {"text": texto_mensagem}}
     
+    # === ADICIONE ESTAS DUAS LINHAS PARA DEBUGAR ===
+    print(f"DEBUG - URL DA API: {url}")
+    print(f"DEBUG - NOME DA INSTANCIA: {INSTANCE_NAME}")
+    # ===============================================
+
     print(f"--- ENVIANDO PARA: {numero_destino} ---")
     try:
         response = requests.post(url, json=payload, headers=headers)
         print(f"Status Evolution: {response.status_code}")
+        
+        # === ADICIONE ESTA LINHA PARA VER O ERRO COMPLETO ===
+        if response.status_code != 200:
+            print(f"RESPOSTA DE ERRO DA EVOLUTION: {response.text}")
+        # ====================================================
+            
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
