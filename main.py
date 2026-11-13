@@ -47,7 +47,7 @@ def criar_evento(nome, servico, data_inicio, duracao):
 
 # --- Função de Envio ---
 def enviar_whatsapp(numero_destino, texto_mensagem):
-    url = f"{EVOLUTION_API_URL}/message/sendText/{INSTANCE_NAME}"
+    url = f"{EVOLUTION_API_URL.rstrip('/')}/message/sendText/{INSTANCE_NAME}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
     payload = {"number": numero_destino, "textMessage": {"text": texto_mensagem}}
     
