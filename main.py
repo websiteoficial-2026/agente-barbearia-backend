@@ -2,7 +2,6 @@ from fastapi import FastAPI, Request
 import requests
 import os
 import json
-import re
 from datetime import datetime, timedelta
 from openai import OpenAI
 from google_auth import get_calendar_service
@@ -28,22 +27,24 @@ user_last_events = {}
 
 # --- Função FAXINEIRO DE JSON SUPER RESISTENTE ---
 def extrair_json(texto):
+    # Limpa blocos de código markdown que a IA às vezes envia
+    texto_limpo = texto.replace('```json', '').replace('```', '').strip()
     try:
-        return json.loads(texto)
-    except json.JSONDecodeError as e:
-        print(f"Falha no JSON direto: {e}")
-        match = re.search(r'\{.*\}', texto, re.DOTALL)
-        if match:
+        return json.loads(texto_limpo)
+    except json.JSONDecodeError:
+        # Tenta achar a primeira chave '{' e a última '}'
+        start = texto_limpo.find('{')
+        end = texto_limpo.rfind('}')
+        if start != -1 and end != -1 and start < end:
             try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError as e2:
-                print(f"Falha no JSON após regex: {e2}")
-        
-        # Se chegar aqui, o JSON está totalmente corrompido. Vamos mostrar o que a IA falou!
-        print(f"--- TEXTO BRUTO DA IA QUE QUEBROU O SISTEMA ---")
-        print(texto)
-        print(f"-----------------------------------------------")
-        return None
+                return json.loads(texto_limpo[start:end+1])
+            except:
+                pass
+                
+    print(f"--- TEXTO BRUTO DA IA QUE QUEBROU O SISTEMA ---")
+    print(texto)
+    print(f"-----------------------------------------------")
+    return None
 
 # --- Funções Auxiliares ---
 def checar_disponibilidade(data_inicio, duracao=30):
@@ -77,8 +78,6 @@ def enviar_whatsapp(numero_destino, texto_mensagem):
     try:
         response = requests.post(url, json=payload, headers=headers)
         print(f"Status Evolução: {response.status_code}")
-        if response.status_code not in [200, 201]:
-            print(f"RESPOSTA DE ERRO DA EVOLUÇÃO: {response.text}")
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
@@ -105,27 +104,25 @@ async def receber_webhook(request: Request):
                 user_memories[numero_usuario] = []
                 user_names[numero_usuario] = None
 
-            agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            agora = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             nome_atual = user_names.get(numero_usuario) or "Não identificado"
             
             system_prompt = f"""
-            Você é a Sofia, recepcionista da Barbearia do João. Você é educada, humana e profissional.
-            Data/Hora atual: {agora}.
+            Você é a Sofia, recepcionista da Barbearia do João.
+            Data/Hora atual do sistema: {agora}.
             Nome do cliente: {nome_atual}
             Serviços: Corte Simples (30min, R$30), Corte+Barba (45min, R$50), Barba (20min, R$20).
             
-            REGRAS IMPORTANTES (Responda SEMPRE em formato JSON puro):
-            1. Se o nome for "Não identificado", pergunte o nome de forma educada ANTES de prosseguir.
+            REGRAS (Responda APENAS o objeto JSON, sem crases, sem texto antes ou depois):
+            1. Se o nome for "Não identificado", pergunte o nome.
             2. Se o cliente informar o nome, retorne: 
             {{"acao": "informar_nome", "nome": "Nome", "resposta": "Sua saudação"}}
-            3. Se o cliente perguntar por um horário, retorne (A data DEVE ser no formato YYYY-MM-DDTHH:MM, ex: 2026-11-13T13:00):
-            {{"acao": "verificar_horario", "horario": "2026-11-13T13:00", "servico": "nome do serviço"}}
-            4. Se o cliente pedir para mudar um agendamento feito, retorne:
-            {{"acao": "reagendar", "horario_novo": "2026-11-14T15:00", "servico": "nome"}}
+            3. Se o cliente perguntar por um horário, você deve calcular a data exata baseada na "Data/Hora atual" e retornar:
+            {{"acao": "verificar_horario", "horario": "YYYY-MM-DDTHH:MM", "servico": "nome"}}
+            4. Se o cliente pedir para mudar um agendamento, retorne:
+            {{"acao": "reagendar", "horario_novo": "YYYY-MM-DDTHH:MM", "servico": "nome"}}
             5. Para dúvidas ou conversas, retorne:
             {{"acao": "duvida", "resposta": "Sua resposta"}}
-            
-            ATENÇÃO: O formato AAAA-MM-DDTHH:MM é de uso INTERNO. NUNCA peça esse formato ao cliente.
             """
 
             messages_for_api = [{"role": "system", "content": system_prompt}]
@@ -135,7 +132,7 @@ async def receber_webhook(request: Request):
             user_memories[numero_usuario].append({"role": "user", "content": texto_recebido})
             messages_for_api.append({"role": "user", "content": texto_recebido})
 
-            # Forçando o modelo a gerar um JSON
+            # Chamada da IA
             response = client.chat.completions.create(
                 model=model_name,
                 messages=messages_for_api, 
@@ -146,77 +143,76 @@ async def receber_webhook(request: Request):
             intencao = extrair_json(resposta_ia_raw)
             
             if not intencao:
-                enviar_whatsapp(numero_usuario, "Desculpe, me confundi com as datas. Pode me dizer o dia e horário novamente?")
+                enviar_whatsapp(numero_usuario, "Desculpe, me confundi com os dados. Pode me dizer o dia e horário novamente?")
                 return {"status": "ok"}
 
             user_memories[numero_usuario].append({"role": "assistant", "content": json.dumps(intencao)})
-
             resposta_final = ""
             acao = intencao.get("acao")
 
             if acao == "informar_nome":
                 user_names[numero_usuario] = intencao["nome"]
-                resposta_final = intencao.get("resposta", f"Prazer em te conhecer, {intencao['nome']}! Como posso ajudar?")
+                resposta_final = intencao.get("resposta", f"Prazer, {intencao['nome']}!")
 
             elif acao == "verificar_horario":
                 try:
+                    # Converte a data que a IA mandou
                     data_inicio = datetime.fromisoformat(intencao["horario"])
-                except ValueError:
-                    enviar_whatsapp(numero_usuario, "Não entendi a data. Pode repetir? (ex: amanhã às 14h)")
-                    return {"status": "ok"}
-
-                servico = intencao.get("servico", "Corte Simples")
-                
-                if checar_disponibilidade(data_inicio):
-                    if not user_names.get(numero_usuario):
-                        resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')}. Só me diga seu nome para eu confirmar."
+                    servico = intencao.get("servico", "Corte Simples")
+                    
+                    if checar_disponibilidade(data_inicio):
+                        if not user_names.get(numero_usuario):
+                            resposta_final = f"✅ Temos horário às {data_inicio.strftime('%H:%M')}. Qual o seu nome?"
+                        else:
+                            duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
+                            
+                            # Tenta criar no calendário
+                            try:
+                                evento_id = criar_evento(user_names[numero_usuario], servico, data_inicio, duracao)
+                                user_last_events[numero_usuario] = evento_id 
+                                resposta_final = f"✅ Agendado! {servico} confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
+                            except Exception as e_cal:
+                                print(f"ERRO NO GOOGLE CALENDAR: {e_cal}")
+                                resposta_final = "⚠️ Tive um problema ao acessar a agenda. Pode tentar novamente?"
                     else:
-                        duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                        evento_id = criar_evento(user_names[numero_usuario], servico, data_inicio, duracao)
-                        user_last_events[numero_usuario] = evento_id 
-                        resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
-                else:
-                    resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado. Gostaria de tentar outro horário?"
+                        resposta_final = f"❌ O horário das {data_inicio.strftime('%H:%M')} está ocupado."
+                        
+                except Exception as e_data:
+                    print(f"ERRO NA DATA DA IA: {e_data} | Data recebida: {intencao.get('horario')}")
+                    resposta_final = "❌ Não consegui entender a data. Pode repetir? (ex: amanhã às 14h)"
 
             elif acao == "reagendar":
                 if not user_names.get(numero_usuario):
-                    resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
+                    resposta_final = "Qual é o seu nome para eu localizar o agendamento?"
                 else:
                     try:
                         dt_novo = datetime.fromisoformat(intencao["horario_novo"])
-                    except ValueError:
-                        enviar_whatsapp(numero_usuario, "Não entendi a nova data. Pode repetir?")
-                        return {"status": "ok"}
+                        servico = intencao.get("servico", "Corte Simples")
+                        duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
                         
-                    servico = intencao.get("servico", "Corte Simples")
-                    duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-
-                    service = get_calendar_service()
-                    deletou = False
-                    
-                    if user_last_events.get(numero_usuario):
                         try:
-                            service.events().delete(calendarId=CALENDAR_ID, eventId=user_last_events[numero_usuario]).execute()
-                            user_last_events[numero_usuario] = None
-                            deletou = True
-                        except Exception:
-                            pass
-
-                    if not deletou:
-                        resposta_final = "Não localizei seu agendamento anterior. Vamos fazer um novo?"
-                    else:
-                        if checar_disponibilidade(dt_novo, duracao):
-                            evento_id = criar_evento(user_names[numero_usuario], servico, dt_novo, duracao)
-                            user_last_events[numero_usuario] = evento_id
-                            resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi reagendado para {dt_novo.strftime('%d/%m às %H:%M')}."
-                        else:
-                            resposta_final = f"❌ Infelizmente, o horário das {dt_novo.strftime('%H:%M')} está ocupado. O antigo foi cancelado, qual outro horário fica bom?"
+                            service = get_calendar_service()
+                            if user_last_events.get(numero_usuario):
+                                service.events().delete(calendarId=CALENDAR_ID, eventId=user_last_events[numero_usuario]).execute()
+                            
+                            if checar_disponibilidade(dt_novo, duracao):
+                                evento_id = criar_evento(user_names[numero_usuario], servico, dt_novo, duracao)
+                                user_last_events[numero_usuario] = evento_id
+                                resposta_final = f"✅ Reagendado! {servico} para {dt_novo.strftime('%d/%m às %H:%M')}."
+                            else:
+                                resposta_final = f"❌ O horário das {dt_novo.strftime('%H:%M')} está ocupado."
+                        except Exception as e_cal:
+                            print(f"ERRO NO GOOGLE CALENDAR: {e_cal}")
+                            resposta_final = "⚠️ Tive um problema ao acessar a agenda para reagendar."
+                            
+                    except Exception as e_data:
+                        resposta_final = "❌ Não entendi a nova data. Pode repetir?"
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
             enviar_whatsapp(numero_usuario, resposta_final)
 
         except Exception as e:
-            print(f"Erro ao processar: {e}")
+            print(f"Erro GLOBAL ao processar: {e}")
             
     return {"status": "ok"}
