@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 import requests
 import os
 import json
-import re # <-- Adicionado para limpar o JSON
+import re
 from datetime import datetime, timedelta
 from openai import OpenAI
 from google_auth import get_calendar_service
@@ -26,20 +26,24 @@ user_memories = {}
 user_names = {}         
 user_last_events = {}   
 
-# --- Função FAXINEIRO DE JSON (Limpa a resposta da IA) ---
+# --- Função FAXINEIRO DE JSON SUPER RESISTENTE ---
 def extrair_json(texto):
     try:
-        # Tenta ler direto
         return json.loads(texto)
-    except json.JSONDecodeError:
-        # Se falhar, tenta achar o JSON no meio do texto usando Regex
+    except json.JSONDecodeError as e:
+        print(f"Falha no JSON direto: {e}")
         match = re.search(r'\{.*\}', texto, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(0))
-            except:
-                pass
-    return None # Se não achar, retorna nada
+            except json.JSONDecodeError as e2:
+                print(f"Falha no JSON após regex: {e2}")
+        
+        # Se chegar aqui, o JSON está totalmente corrompido. Vamos mostrar o que a IA falou!
+        print(f"--- TEXTO BRUTO DA IA QUE QUEBROU O SISTEMA ---")
+        print(texto)
+        print(f"-----------------------------------------------")
+        return None
 
 # --- Funções Auxiliares ---
 def checar_disponibilidade(data_inicio, duracao=30):
@@ -110,18 +114,18 @@ async def receber_webhook(request: Request):
             Nome do cliente: {nome_atual}
             Serviços: Corte Simples (30min, R$30), Corte+Barba (45min, R$50), Barba (20min, R$20).
             
-            REGRAS IMPORTANTES (Responda SEMPRE em formato JSON puro, sem blocos de código markdown):
+            REGRAS IMPORTANTES (Responda SEMPRE em formato JSON puro):
             1. Se o nome for "Não identificado", pergunte o nome de forma educada ANTES de prosseguir.
             2. Se o cliente informar o nome, retorne: 
-            {{"acao": "informar_nome", "nome": "Nome", "resposta": "Sua saudação usando o histórico para continuar o assunto"}}
-            3. Se o cliente perguntar por um horário (ex: "tem 14h?"), retorne:
-            {{"acao": "verificar_horario", "horario": "AAAA-MM-DDTHH:MM", "servico": "nome do serviço se ele citou, senão deixe nulo"}}
+            {{"acao": "informar_nome", "nome": "Nome", "resposta": "Sua saudação"}}
+            3. Se o cliente perguntar por um horário, retorne (A data DEVE ser no formato YYYY-MM-DDTHH:MM, ex: 2026-11-13T13:00):
+            {{"acao": "verificar_horario", "horario": "2026-11-13T13:00", "servico": "nome do serviço"}}
             4. Se o cliente pedir para mudar um agendamento feito, retorne:
-            {{"acao": "reagendar", "horario_novo": "AAAA-MM-DDTHH:MM", "servico": "nome"}}
+            {{"acao": "reagendar", "horario_novo": "2026-11-14T15:00", "servico": "nome"}}
             5. Para dúvidas ou conversas, retorne:
             {{"acao": "duvida", "resposta": "Sua resposta"}}
-            6. O formato AAAA-MM-DDTHH:MM é de uso INTERNO. NUNCA peça nem mencione esse formato ao cliente.
-            7. Se o cliente já escolheu o serviço mas ainda não disse dia e horário, use "acao": "duvida" e pergunte de forma natural.
+            
+            ATENÇÃO: O formato AAAA-MM-DDTHH:MM é de uso INTERNO. NUNCA peça esse formato ao cliente.
             """
 
             messages_for_api = [{"role": "system", "content": system_prompt}]
@@ -131,23 +135,20 @@ async def receber_webhook(request: Request):
             user_memories[numero_usuario].append({"role": "user", "content": texto_recebido})
             messages_for_api.append({"role": "user", "content": texto_recebido})
 
-            # Removemos o response_format para o Llama não engasgar
+            # Forçando o modelo a gerar um JSON
             response = client.chat.completions.create(
                 model=model_name,
-                messages=messages_for_api
+                messages=messages_for_api, 
+                response_format={"type": "json_object"}
             )
             
             resposta_ia_raw = response.choices[0].message.content
-            
-            # Usa o faxineiro para pegar o JSON
             intencao = extrair_json(resposta_ia_raw)
             
             if not intencao:
-                print(f"ERRO CRÍTICO: IA não retornou JSON válido. Resposta bruta: {resposta_ia_raw}")
-                enviar_whatsapp(numero_usuario, "Desculpe, tive um problema interno. Pode repetir?")
+                enviar_whatsapp(numero_usuario, "Desculpe, me confundi com as datas. Pode me dizer o dia e horário novamente?")
                 return {"status": "ok"}
 
-            # Salva no histórico apenas o JSON limpo para não poluir a memória
             user_memories[numero_usuario].append({"role": "assistant", "content": json.dumps(intencao)})
 
             resposta_final = ""
@@ -158,20 +159,22 @@ async def receber_webhook(request: Request):
                 resposta_final = intencao.get("resposta", f"Prazer em te conhecer, {intencao['nome']}! Como posso ajudar?")
 
             elif acao == "verificar_horario":
-                data_inicio = datetime.fromisoformat(intencao["horario"])
-                servico = intencao.get("servico")
+                try:
+                    data_inicio = datetime.fromisoformat(intencao["horario"])
+                except ValueError:
+                    enviar_whatsapp(numero_usuario, "Não entendi a data. Pode repetir? (ex: amanhã às 14h)")
+                    return {"status": "ok"}
+
+                servico = intencao.get("servico", "Corte Simples")
                 
                 if checar_disponibilidade(data_inicio):
-                    if servico:
-                        if not user_names.get(numero_usuario):
-                            resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')}. Só me diga seu nome para eu confirmar o agendamento."
-                        else:
-                            duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                            evento_id = criar_evento(user_names[numero_usuario], servico, data_inicio, duracao)
-                            user_last_events[numero_usuario] = evento_id 
-                            resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
+                    if not user_names.get(numero_usuario):
+                        resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')}. Só me diga seu nome para eu confirmar."
                     else:
-                        resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')} do dia {data_inicio.strftime('%d/%m')}. Qual serviço deseja?"
+                        duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
+                        evento_id = criar_evento(user_names[numero_usuario], servico, data_inicio, duracao)
+                        user_last_events[numero_usuario] = evento_id 
+                        resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
                 else:
                     resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado. Gostaria de tentar outro horário?"
 
@@ -179,8 +182,13 @@ async def receber_webhook(request: Request):
                 if not user_names.get(numero_usuario):
                     resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
                 else:
-                    dt_novo = datetime.fromisoformat(intencao["horario_novo"])
-                    servico = intencao["servico"]
+                    try:
+                        dt_novo = datetime.fromisoformat(intencao["horario_novo"])
+                    except ValueError:
+                        enviar_whatsapp(numero_usuario, "Não entendi a nova data. Pode repetir?")
+                        return {"status": "ok"}
+                        
+                    servico = intencao.get("servico", "Corte Simples")
                     duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
 
                     service = get_calendar_service()
