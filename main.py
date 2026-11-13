@@ -5,7 +5,6 @@ import json
 from datetime import datetime, timedelta
 from openai import OpenAI
 from google_auth import get_calendar_service
-import base64
 
 app = FastAPI()
 
@@ -21,7 +20,10 @@ client = OpenAI(api_key=api_key, base_url=base_url)
 
 CALENDAR_ID = 'dominio3004@gmail.com'
 
-# --- Funções do Google Calendar ---
+# === MEMÓRIA DO CHAT ===
+# Guarda o histórico de conversas por número de telefone
+user_memories = {}
+
 def checar_disponibilidade(data_inicio, duracao=30):
     data_fim = data_inicio + timedelta(minutes=duracao)
     service = get_calendar_service()
@@ -45,28 +47,19 @@ def criar_evento(nome, servico, data_inicio, duracao):
     evento_criado = service.events().insert(calendarId=CALENDAR_ID, body=evento_body).execute()
     return evento_criado['id']
 
-# --- Função de Envio ---
 def enviar_whatsapp(numero_destino, texto_mensagem):
     url = f"{EVOLUTION_API_URL.rstrip('/')}/message/sendText/{INSTANCE_NAME}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
+    payload = {"number": numero_destino, "text": texto_mensagem}
     
-    # === ALTERE O PAYLOAD PARA ESTE FORMATO ===
-    payload = {
-        "number": numero_destino,
-        "text": texto_mensagem
-    }
-    # ==========================================
-
-    print(f"--- ENVIANDO PARA: {numero_destino} ---")
     try:
         response = requests.post(url, json=payload, headers=headers)
-        print(f"Status Evolution: {response.status_code}")
-        if response.status_code != 200:
-            print(f"RESPOSTA DE ERRO DA EVOLUTION: {response.text}")
+        print(f"Status Envio: {response.status_code}")
+        if response.status_code not in [200, 201]:
+            print(f"RESPOSTA DE ERRO: {response.text}")
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
-# --- Endpoint do Webhook ---
 @app.post("/webhook/whatsapp")
 async def receber_webhook(request: Request):
     data = await request.json()
@@ -77,7 +70,6 @@ async def receber_webhook(request: Request):
             remote_jid = message_data["key"]["remoteJid"]
             numero_usuario = remote_jid.split("@")[0]
             
-            # Ignora mensagens enviadas pelo próprio bot
             if message_data["key"].get("fromMe"): 
                 return {"status": "ok"}
 
@@ -87,7 +79,10 @@ async def receber_webhook(request: Request):
 
             print(f"Mensagem de {numero_usuario}: {texto_recebido}")
 
-            # --- LÓGICA DA SOFIA ---
+            # === RECUPERANDO MEMÓRIA ===
+            if numero_usuario not in user_memories:
+                user_memories[numero_usuario] = []
+
             agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
             system_prompt = f"""
@@ -96,35 +91,46 @@ async def receber_webhook(request: Request):
             Serviços: Corte Simples (30min, R$30), Corte+Barba (45min, R$50), Barba (20min, R$20).
             
             REGRAS IMPORTANTES (Responda SEMPRE em formato JSON):
-            1. Se o cliente for novo, pergunte o nome de forma educada ANTES de prosseguir.
+            1. Se você ainda não sabe o nome do cliente, pergunte de forma educada ANTES de prosseguir.
             2. Se o cliente informar o nome, retorne: 
             {{"acao": "informar_nome", "nome": "Nome", "resposta": "Sua saudação"}}
             3. Se o cliente perguntar por um horário, retorne:
             {{"acao": "verificar_horario", "horario": "AAAA-MM-DDTHH:MM", "servico": "nome do serviço", "nome": "nome do cliente se ele disse"}}
             4. Para dúvidas ou conversas, retorne:
             {{"acao": "duvida", "resposta": "Sua resposta"}}
+            
+            NUNCA use o formato AAAA-MM-DDTHH:MM na resposta para o cliente, apenas no JSON interno.
             """
 
-            messages_for_api = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": texto_recebido}
-            ]
+            # Monta o histórico para enviar para a IA
+            messages_for_api = [{"role": "system", "content": system_prompt}]
+            for msg in user_memories[numero_usuario]:
+                messages_for_api.append(msg)
+            
+            # Adiciona a nova mensagem do usuário no histórico
+            user_memories[numero_usuario].append({"role": "user", "content": texto_recebido})
+            messages_for_api.append({"role": "user", "content": texto_recebido})
 
             response = client.chat.completions.create(
                 model=model_name,
                 messages=messages_for_api, 
                 response_format={"type": "json_object"}
             )
-            intencao = json.loads(response.choices[0].message.content)
+            resposta_ia_raw = response.choices[0].message.content
+            intencao = json.loads(resposta_ia_raw)
+            
+            # Salva a resposta da IA no histórico (para ela lembrar do que ela mesma disse)
+            user_memories[numero_usuario].append({"role": "assistant", "content": resposta_ia_raw})
+
             acao = intencao.get("acao")
             resposta_final = ""
 
-            # Processamento básico para teste
             if acao == "informar_nome":
                 resposta_final = intencao.get("resposta")
+                # O nome fica salvo no histórico para as próximas mensagens
             elif acao == "verificar_horario":
                 data_inicio = datetime.fromisoformat(intencao["horario"])
-                servico = intencao.get("servico")
+                servico = intencao.get("servico", "Corte Simples")
                 nome = intencao.get("nome", "Cliente")
                 
                 if checar_disponibilidade(data_inicio):
@@ -136,7 +142,6 @@ async def receber_webhook(request: Request):
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
-            # Envia a resposta
             enviar_whatsapp(numero_usuario, resposta_final)
 
         except Exception as e:
