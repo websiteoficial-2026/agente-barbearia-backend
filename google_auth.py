@@ -1,41 +1,28 @@
 import os
 import json
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2 import service_account # <--- ESSA LINHA É A CHAVE
 from googleapiclient.discovery import build
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 def get_calendar_service():
-    creds = None
-    token_path = 'token.json'
-    credentials_path = 'credentials.json'
+    creds_json_str = os.getenv('GOOGLE_CREDENTIALS_JSON')
+    
+    if not creds_json_str:
+        raise Exception("❌ Variável GOOGLE_CREDENTIALS_JSON não encontrada na Railway.")
 
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-    elif os.getenv('GOOGLE_TOKEN_JSON'):
-        try:
-            # Tenta ler o token. Se estiver mal formatado, avisa.
-            token_str = os.getenv('GOOGLE_TOKEN_JSON')
-            token_info = json.loads(token_str)
-            creds = Credentials.from_authorized_user_info(token_info, SCOPES)
-        except json.JSONDecodeError as e:
-            print(f"❌ ERRO FATAL: O GOOGLE_TOKEN_JSON está mal formatado! Erro: {e}")
-            raise Exception("Token do Google inválido")
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if os.path.exists(credentials_path):
-                flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-                creds = flow.run_local_server(port=0)
-            else:
-                raise Exception("Credenciais do Google não encontradas.")
+    try:
+        # Corrige o problema de quebra de linha na chave privada
+        creds_json_str = creds_json_str.replace('\\n', '\n')
+        creds_info = json.loads(creds_json_str)
         
-        if not os.getenv('GOOGLE_TOKEN_JSON'):
-            with open(token_path, 'w') as token:
-                token.write(creds.to_json())
-
-    return build('calendar', 'v3', credentials=creds)
+        # ISSO AQUI É O QUE DIFERENCIA A CONTA DE SERVIÇO
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info, scopes=SCOPES
+        )
+        
+        return build('calendar', 'v3', credentials=creds)
+        
+    except Exception as e:
+        print(f"❌ Erro ao autenticar com Conta de Serviço: {e}")
+        raise e
