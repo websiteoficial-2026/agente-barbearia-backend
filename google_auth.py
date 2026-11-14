@@ -1,22 +1,22 @@
 import os
 import json
-from google.oauth2 import service_account # <--- ESSA LINHA É A CHAVE
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 def get_calendar_service():
+    # Pega o JSON da variável de ambiente
     creds_json_str = os.getenv('GOOGLE_CREDENTIALS_JSON')
     
     if not creds_json_str:
         raise Exception("❌ Variável GOOGLE_CREDENTIALS_JSON não encontrada na Railway.")
 
     try:
-        # Corrige o problema de quebra de linha na chave privada
-        creds_json_str = creds_json_str.replace('\\n', '\n')
+        # O json.loads já sabe lidar com os "\n" da private_key
         creds_info = json.loads(creds_json_str)
         
-        # ISSO AQUI É O QUE DIFERENCIA A CONTA DE SERVIÇO
+        # Autentica usando a Conta de Serviço
         creds = service_account.Credentials.from_service_account_info(
             creds_info, scopes=SCOPES
         )
