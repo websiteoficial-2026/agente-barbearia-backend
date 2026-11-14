@@ -3,11 +3,11 @@ import requests
 import os
 import json
 import re
+import sqlite3
 from datetime import datetime, timedelta
 from openai import OpenAI
 from google_auth import get_calendar_service
 import dateparser
-import database # <--- IMPORTANDO O SEU ARQUIVO DE BANCO DE DADOS
 
 app = FastAPI()
 
@@ -23,42 +23,79 @@ client = OpenAI(api_key=api_key, base_url=base_url)
 
 CALENDAR_ID = 'dominio3004@gmail.com'
 
-# --- INICIALIZAÇÃO DO BANCO DE DADOS ---
-@app.on_event("startup")
-def startup_event():
-    database.init_database()
+# --- Configuração do Banco de Dados (SQLite) ---
+DB_PATH = "/data/barbearia.db"
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
     print("✅ Banco de dados inicializado.")
+
+init_db()
+
+def get_chat_history(session_id: str, limit: int = 10):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT role, content FROM messages 
+        WHERE session_id = ? 
+        ORDER BY id DESC LIMIT ?
+    ''', (session_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+    # Inverte para a ordem correta e monta a lista para a IA
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+def save_message(session_id: str, role: str, content: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO messages (session_id, role, content) 
+        VALUES (?, ?, ?)
+    ''', (session_id, role, content))
+    conn.commit()
+    conn.close()
 
 # --- Faxineiro de JSON (Blindado) ---
 def extrair_json(texto):
     if not texto: return None
+    # Remove markdown e espaços
+    texto_limpo = texto.replace('```json', '').replace('```', '').strip()
+    
     try:
-        return json.loads(texto)
+        return json.loads(texto_limpo)
     except:
-        pass
-    match = re.search(r'\{.*\}', texto, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except:
-            pass
-        try:
-            texto_corrigido = match.group(0).replace("'", '"')
-            return json.loads(texto_corrigido)
-        except:
-            pass
-    print(f"--- ERRO: A IA NÃO GEROU UM JSON VÁLIDO ---")
-    print(texto)
+        # Tenta achar o primeiro { e o último }
+        start = texto_limpo.find('{')
+        end = texto_limpo.rfind('}')
+        if start != -1 and end != -1 and start < end:
+            try:
+                return json.loads(texto_limpo[start:end+1])
+            except:
+                pass
+    
+    # Se chegar aqui, a IA falhou miseravelmente. Vamos criar uma resposta de fallback.
+    print(f"⚠️ A IA NÃO GEROU JSON VÁLIDO. Texto bruto:\n{texto}")
     return None
 
-# --- Parser de Data Humano ---
 def parse_data(texto_data):
     try:
         return datetime.fromisoformat(texto_data)
     except:
         return dateparser.parse(texto_data, languages=['pt'])
 
-# --- Funções Auxiliares ---
 def checar_disponibilidade(data_inicio, duracao=30):
     data_fim = data_inicio + timedelta(minutes=duracao)
     service = get_calendar_service()
@@ -111,37 +148,38 @@ async def receber_webhook(request: Request):
 
             print(f"Mensagem de {numero_usuario}: {texto_recebido}")
 
-            # 1. Salva a mensagem recebida no banco de dados
-            database.salvar_conversa(numero_usuario, texto_recebido, "recebida")
-
-            # 2. Recupera o histórico do banco de dados (últimas 10 mensagens)
-            historico_db = database.obter_historico(numero_usuario, limite=10)
+            # 1. Busca histórico ANTES de salvar a nova mensagem
+            historico = get_chat_history(numero_usuario)
             
-            # Monta o histórico no formato que a OpenAI entende
-            messages_for_api = []
-            for msg_texto, msg_tipo, _ in historico_db:
-                role = "user" if msg_tipo == "recebida" else "assistant"
-                messages_for_api.append({"role": role, "content": msg_texto})
+            # 2. Salva a nova mensagem no banco
+            save_message(numero_usuario, "user", texto_recebido)
 
             agora = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             
+            # PROMPT BLINDADO
             system_prompt = f"""
             Você é a Sofia, recepcionista da Barbearia do João.
-            Data/Hora atual do sistema: {agora}.
+            Data/Hora atual: {agora}.
             Serviços: Corte Simples (30min, R$30), Corte+Barba (45min, R$50), Barba (20min, R$20).
             
-            REGRAS (Responda APENAS o objeto JSON puro):
-            1. Se você ainda não sabe o nome do cliente (verifique o histórico), pergunte o nome.
-            2. Se o cliente informar o nome, retorne: 
-            {{"acao": "informar_nome", "nome": "Nome", "resposta": "Sua saudação"}}
-            3. Se o cliente pedir um horário, você DEVE retornar no campo "horario" a data exata no formato YYYY-MM-DDTHH:MM.
-               Exemplo: Se o cliente disser "hoje às 11h", e a data atual for 2026-11-13, retorne "2026-11-13T11:00".
-            {{"acao": "verificar_horario", "horario": "2026-11-13T11:00", "servico": "Corte Simples"}}
-            4. Para dúvidas, retorne: {{"acao": "duvida", "resposta": "Sua resposta"}}
+            HISTÓRICO DA CONVERSA (Leia com atenção para não repetir perguntas):
+            {historico}
+            
+            REGRAS (Responda APENAS em JSON puro, sem markdown):
+            1. Se no histórico o cliente já disse o nome, NUNCA pergunte de novo.
+            2. Se o cliente pedir um horário, você deve calcular a data.
+               Exemplo: Se ele disse "hoje às 10h" e hoje é {agora[:10]}, retorne "YYYY-MM-DDTHH:MM".
+               Use: {{"acao": "verificar_horario", "horario": "2026-11-14T10:00", "servico": "Corte+Barba", "nome": "Nome do Cliente"}}
+            3. Para conversas gerais: {{"acao": "duvida", "resposta": "Sua resposta"}}
             """
 
-            # Insere o system prompt no começo da lista
-            messages_for_api.insert(0, {"role": "system", "content": system_prompt})
+            # Monta as mensagens para a API da OpenAI
+            messages_for_api = [{"role": "system", "content": system_prompt}]
+            # Adiciona o histórico recente
+            for msg in historico:
+                messages_for_api.append(msg)
+            # Adiciona a mensagem atual
+            messages_for_api.append({"role": "user", "content": texto_recebido})
 
             response = client.chat.completions.create(
                 model=model_name,
@@ -152,84 +190,49 @@ async def receber_webhook(request: Request):
             resposta_ia_raw = response.choices[0].message.content
             intencao = extrair_json(resposta_ia_raw)
             
+            # Se a IA falhou e não gerou JSON, salvamos a resposta bruta como fallback
             if not intencao:
-                enviar_whatsapp(numero_usuario, "Desculpe, tive um pequeno erro técnico. Pode repetir o dia e horário?")
-                return {"status": "ok"}
+                intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir?"}
 
-            # 3. Salva a resposta da IA no banco (para ela lembrar do que ela mesma disse)
-            database.salvar_conversa(numero_usuario, json.dumps(intencao), "enviada")
-
+            # Salva a resposta da IA no banco
+            save_message(numero_usuario, "assistant", json.dumps(intencao))
+            
             resposta_final = ""
             acao = intencao.get("acao")
+            nome_ia = intencao.get("nome", "")
 
-            if acao == "informar_nome":
-                # Salva o nome do cliente na tabela de clientes do seu banco
-                database.registrar_cliente(numero_usuario, intencao["nome"])
-                resposta_final = intencao.get("resposta", f"Prazer, {intencao['nome']}!")
-
-            elif acao == "verificar_horario":
+            if acao == "verificar_horario":
                 data_inicio = parse_data(intencao.get("horario", ""))
+                servico = intencao.get("servico", "Corte Simples")
                 
-                if not data_inicio:
-                    resposta_final = "❌ Não consegui entender a data. Pode repetir? (ex: amanhã às 14h)"
+                # Checa se o nome está no JSON ou se já temos no histórico
+                if not nome_ia and not any("Prazer" in m["content"] or "nome é" in m["content"] for m in historico):
+                     resposta_final = "Qual é o seu nome para eu confirmar o agendamento?"
+                elif not data_inicio:
+                    resposta_final = "❌ Não consegui entender a data. Pode repetir? (ex: hoje às 10h)"
                 else:
-                    servico = intencao.get("servico", "Corte Simples")
-                    
-                    # Busca o nome no banco. (Como seu database.py não tem função de buscar nome,
-                    # vamos usar uma query simples ou assumir que a IA já sabe pelo contexto).
-                    # Para simplificar, usaremos "Cliente" se não soubermos. 
-                    # (Dica: você pode adicionar uma função obter_cliente no database.py depois).
-                    nome_cliente = "Cliente" 
-                    
                     if checar_disponibilidade(data_inicio):
                         duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
                         try:
-                            evento_id = criar_evento(nome_cliente, servico, data_inicio, duracao)
-                            
-                            # Salva o agendamento no banco local SQLite
-                            database.salvar_agendamento(evento_id, numero_usuario, nome_cliente, servico, data_inicio, duracao)
-                            
+                            evento_id = criar_evento(nome_ia or "Cliente", servico, data_inicio, duracao)
                             resposta_final = f"✅ Agendado! {servico} confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
                         except Exception as e_cal:
                             print(f"ERRO NO GOOGLE CALENDAR: {e_cal}")
-                            resposta_final = "⚠️ Tive um problema ao acessar a agenda. Pode tentar novamente?"
+                            resposta_final = "⚠️ Tive um problema ao acessar a agenda."
                     else:
                         resposta_final = f"❌ O horário das {data_inicio.strftime('%H:%M')} está ocupado."
-
-            elif acao == "reagendar":
-                dt_novo = parse_data(intencao.get("horario_novo", ""))
-                if not dt_novo:
-                        resposta_final = "❌ Não entendi a nova data. Pode repetir?"
-                else:
-                    servico = intencao.get("servico", "Corte Simples")
-                    duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                    try:
-                        service = get_calendar_service()
-                        # Busca o último evento no seu banco de dados
-                        agendamentos = database.obter_agendamentos_cliente(numero_usuario)
-                        if agendamentos:
-                            # Pega o evento mais recente
-                            evento_id_antigo = agendamentos[0][0] # Supondo que o ID esteja na posição 0
-                            service.events().delete(calendarId=CALENDAR_ID, eventId=evento_id_antigo).execute()
-                            database.cancelar_agendamento(evento_id_antigo)
-                        
-                        if checar_disponibilidade(dt_novo, duracao):
-                            evento_id = criar_evento("Cliente", servico, dt_novo, duracao)
-                            database.salvar_agendamento(evento_id, numero_usuario, "Cliente", servico, dt_novo, duracao)
-                            resposta_final = f"✅ Reagendado! {servico} para {dt_novo.strftime('%d/%m às %H:%M')}."
-                        else:
-                            resposta_final = f"❌ O horário das {dt_novo.strftime('%H:%M')} está ocupado."
-                    except Exception as e_cal:
-                        print(f"ERRO NO GOOGLE CALENDAR: {e_cal}")
-                        resposta_final = "⚠️ Tive um problema ao acessar a agenda para reagendar."
             else:
+                # Se a ação for dúvida, apenas responde o que a IA escreveu
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
-            # Envia a resposta para o cliente e salva no banco
             enviar_whatsapp(numero_usuario, resposta_final)
-            database.salvar_conversa(numero_usuario, resposta_final, "enviada")
 
         except Exception as e:
             print(f"Erro GLOBAL ao processar: {e}")
+            # Em caso de erro, tenta avisar o usuário em vez de ficar mudo
+            try:
+                enviar_whatsapp(numero_usuario, "⚠️ Ops, tive um pequeno erro interno. Pode repetir sua última mensagem?")
+            except:
+                pass
             
     return {"status": "ok"}
