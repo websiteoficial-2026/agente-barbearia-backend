@@ -23,25 +23,16 @@ client = OpenAI(api_key=api_key, base_url=base_url)
 
 CALENDAR_ID = 'dominio3004@gmail.com'
 
-# --- Configuração do Banco de Dados (SQLite) ---
+# --- Banco de Dados ---
 DB_PATH = "/data/barbearia.db"
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    cursor.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)')
     conn.commit()
     conn.close()
-    print("✅ Banco de dados inicializado.")
 
 init_db()
 
@@ -60,23 +51,17 @@ def save_message(session_id: str, role: str, content: str):
     conn.commit()
     conn.close()
 
-# --- Faxineiro de JSON ---
+# --- Faxineiro JSON ---
 def extrair_json(texto):
     if not texto: return None
-    # Limpa blocos de código e espaços
     texto_limpo = texto.replace('```json', '').replace('```', '').strip()
-    
-    # Tenta ler direto
     try: return json.loads(texto_limpo)
     except: pass
-    
-    # Tenta achar o primeiro { e o último }
     start = texto_limpo.find('{')
     end = texto_limpo.rfind('}')
     if start != -1 and end != -1 and start < end:
         try: return json.loads(texto_limpo[start:end+1])
         except: pass
-        
     return None
 
 def parse_data(texto_data):
@@ -123,48 +108,37 @@ async def receber_webhook(request: Request):
 
             print(f"Mensagem de {numero_usuario}: {texto_recebido}")
 
-            # 1. Busca histórico
             historico = get_chat_history(numero_usuario)
-            
-            # 2. Salva a nova mensagem
             save_message(numero_usuario, "user", texto_recebido)
 
             agora = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             
-            # --- PROMPT REFORÇADO ---
             system_prompt = f"""
             Você é a Sofia, recepcionista da Barbearia do João.
             Data/Hora atual: {agora}.
             Serviços: Corte Simples (30min, R$30), Corte+Barba (45min, R$50), Barba (20min, R$20).
             
             REGRAS:
-            1. Se o cliente pedir um horário, você DEVE extrair a data, o serviço e o nome dele.
-            2. Retorne SEMPRE um objeto JSON válido, sem blocos de código markdown, neste formato exato:
+            1. Se o cliente pedir um horário, extraia a data, o serviço e o nome.
+            2. Retorne SEMPRE um objeto JSON válido, sem markdown:
             {{
                 "acao": "agendar",
                 "nome": "Nome do cliente se ele falou, senão null",
                 "servico": "Corte Simples, Corte+Barba ou Barba",
                 "horario": "YYYY-MM-DDTHH:MM"
             }}
-            3. Se o cliente estiver apenas conversando ou você precisar de mais informações, retorne:
-            {{
-                "acao": "duvida",
-                "resposta": "Sua resposta humanizada aqui"
-            }}
+            3. Se o cliente estiver apenas conversando, retorne:
+            {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
             
-            IMPORTANTE: Use o histórico abaixo para saber o nome do cliente se ele já falou antes.
+            IMPORTANTE: Use o histórico abaixo para saber o nome do cliente.
             """
 
             messages_for_api = [{"role": "system", "content": system_prompt}]
             for msg in historico: messages_for_api.append(msg)
             messages_for_api.append({"role": "user", "content": texto_recebido})
 
-            # REMOVEMOS o response_format para o Llama 3 não engasgar
             try:
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages_for_api
-                )
+                response = client.chat.completions.create(model=model_name, messages=messages_for_api)
                 resposta_ia_raw = response.choices[0].message.content
             except Exception as e:
                 print(f"Erro na API da OpenAI: {e}")
@@ -173,12 +147,10 @@ async def receber_webhook(request: Request):
 
             intencao = extrair_json(resposta_ia_raw)
             
-            # Se a IA falhou feio, usamos um fallback seguro
             if not intencao:
                 print(f"⚠️ FALHA NO JSON DA IA: {resposta_ia_raw}")
-                intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi com as datas. Pode repetir o dia e horário?"}
+                intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir o dia e horário?"}
 
-            # Salva a resposta no banco
             save_message(numero_usuario, "assistant", json.dumps(intencao))
             
             resposta_final = ""
@@ -189,7 +161,6 @@ async def receber_webhook(request: Request):
                 servico = intencao.get("servico", "Corte Simples")
                 nome_ia = intencao.get("nome")
                 
-                # Se a IA não achou o nome no JSON, procura no histórico (busca simples)
                 if not nome_ia:
                     for msg in reversed(historico):
                         if msg["role"] == "user" and len(msg["content"].split()) == 1 and msg["content"].istitle():
@@ -201,16 +172,17 @@ async def receber_webhook(request: Request):
                 elif not nome_ia:
                     resposta_final = "✅ Temos horário! Qual é o seu nome para eu confirmar o agendamento?"
                 else:
-                    if checar_disponibilidade(data_inicio):
-                        duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                        try:
+                    # ISOLANDO O ERRO DO GOOGLE CALENDAR AQUI
+                    try:
+                        if checar_disponibilidade(data_inicio):
+                            duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
                             criar_evento(nome_ia, servico, data_inicio, duracao)
                             resposta_final = f"✅ Agendado! {servico} confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
-                        except Exception as e_cal:
-                            print(f"ERRO NO GOOGLE CALENDAR: {e_cal}")
-                            resposta_final = "⚠️ Tive um problema ao acessar a agenda."
-                    else:
-                        resposta_final = f"❌ O horário das {data_inicio.strftime('%H:%M')} está ocupado."
+                        else:
+                            resposta_final = f"❌ O horário das {data_inicio.strftime('%H:%M')} está ocupado."
+                    except Exception as e_cal:
+                        print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
+                        resposta_final = "⚠️ Estou com um problema técnico na agenda. Pode tentar novamente em instantes?"
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
