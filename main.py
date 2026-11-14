@@ -4,7 +4,7 @@ import os
 import json
 import re
 import sqlite3
-import asyncio # <-- Importação necessária para o sleep assíncrono
+import asyncio
 from datetime import datetime, timedelta
 from openai import OpenAI
 from google_auth import get_calendar_service
@@ -65,7 +65,6 @@ def extrair_json(texto):
         except: pass
     return None
 
-# --- Trava de Segurança para Data ---
 def parse_data(texto_data):
     if not texto_data or not isinstance(texto_data, str):
         return None
@@ -96,19 +95,16 @@ def enviar_whatsapp(numero_destino, texto_mensagem):
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
-# --- NOVA FUNÇÃO: Envio com atraso humano (Background) ---
+# --- Envio com atraso humano ---
 async def enviar_com_delay(numero_destino, texto_mensagem):
-    # Cálculo do tempo humano (0.05s por letra)
     tempo_calculado = len(texto_mensagem) * 0.05
-    # Limita o tempo entre 2 e 8 segundos (para não travar a fila)
     tempo_de_espera = min(max(tempo_calculado, 2.0), 8.0)
-    
     print(f"⏳ Sofia está digitando... (aguardando {tempo_de_espera:.1f}s)")
-    await asyncio.sleep(tempo_de_espera) # Pausa sem travar o servidor
+    await asyncio.sleep(tempo_de_espera)
     enviar_whatsapp(numero_destino, texto_mensagem)
 
 @app.post("/webhook/whatsapp")
-async def receber_webhook(request: Request, background_tasks: BackgroundTasks): # <-- Adicionado BackgroundTasks
+async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
     
     if data.get("event") == "messages.upsert":
@@ -130,6 +126,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks): 
 
             agora = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             
+            # PROMPT SUPER RÍGIDO SOBRE O NOME
             system_prompt = f"""
             Você é a Sofia, recepcionista da Barbearia do João.
             Data/Hora atual: {agora}.
@@ -140,14 +137,14 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks): 
             2. Retorne SEMPRE um objeto JSON válido, sem markdown:
             {{
                 "acao": "agendar",
-                "nome": "Nome do cliente se ele falou, senão null",
+                "nome": "Nome do cliente se ele falou EXPLICITAMENTE, senão null",
                 "servico": "Corte Simples, Corte+Barba ou Barba",
                 "horario": "YYYY-MM-DDTHH:MM"
             }}
-            3. Se o cliente estiver apenas conversando, retorne:
+            3. Se o cliente estiver conversando ou faltar informação, retorne:
             {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
             
-            IMPORTANTE: Leia o histórico abaixo. Se o cliente já disse o nome dele, use esse nome. NUNCA use saudações como "Oi", "Olá" ou verbos como nome no campo "nome" do JSON.
+            CRÍTICO: Só preencha o campo "nome" se o cliente disser algo como "Meu nome é X" ou "Sou o X". Se ele apenas mandar "Oi", "Boa tarde", o serviço ou o horário, retorne "nome": null. Se no histórico o nome dele já tiver sido dito explicitamente, você pode usá-lo.
             """
 
             messages_for_api = [{"role": "system", "content": system_prompt}]
@@ -178,25 +175,21 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks): 
                 servico = intencao.get("servico", "Corte Simples")
                 nome_ia = intencao.get("nome")
                 
-                palavras_invalidas = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "tudo bem", "quero", "agendar", "sim", "não", "nao", "corte", "barba", "horario", "horário", "hoje", "amanha", "amanhã", "pode", "ser"]
+                # BLACKLIST AINDA MAIS RÍGIDA DE PALAVRAS QUE NÃO SÃO NOMES
+                palavras_invalidas = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "tudo bem", "tudo bom", "quero", "agendar", "sim", "não", "nao", "corte", "barba", "corte simples", "corte+barba", "hoje", "amanha", "amanhã", "pode", "ser", "para", "as", "horas", "hrs", "horário", "horario", "disponível", "disponivel", "cliente", "null"]
                 
-                if nome_ia and str(nome_ia).lower() in palavras_invalidas:
-                    nome_ia = None
-                
-                if not nome_ia:
-                    for msg in reversed(historico):
-                        if msg["role"] == "user":
-                            texto_msg = msg["content"].strip()
-                            palavras = texto_msg.split()
-                            if 1 <= len(palavras) <= 2:
-                                if texto_msg.lower() not in palavras_invalidas and not any(c.isdigit() for c in texto_msg):
-                                    nome_ia = texto_msg.title()
-                                    break
+                # Se o nome for uma palavra inválida ou tiver mais de 3 palavras, anula.
+                if nome_ia:
+                    nome_limpo = str(nome_ia).lower().strip()
+                    if nome_limpo in palavras_invalidas or len(nome_limpo.split()) > 3:
+                        nome_ia = None
+
+                # REMOVIDO O LOOP DE HISTÓRICO (Era ele que causava o bug de pegar "Oi" como nome)
                 
                 if not data_inicio:
                     resposta_final = "❌ Não consegui entender a data. Pode repetir? (ex: hoje às 10h)"
                 elif not nome_ia:
-                    resposta_final = "✅ Temos horário disponível! Só preciso do seu nome para confirmar o agendamento."
+                    resposta_final = "✅ Temos horário disponível para esse serviço. Só preciso do seu nome para confirmar o agendamento."
                 else:
                     try:
                         if checar_disponibilidade(data_inicio):
@@ -211,7 +204,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks): 
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
-            # USA O BACKGROUND TASKS PARA ENVIAR COM ATRASO E NÃO DAR TIMEOUT
             background_tasks.add_task(enviar_com_delay, numero_usuario, resposta_final)
 
         except Exception as e:
