@@ -64,9 +64,15 @@ def extrair_json(texto):
         except: pass
     return None
 
+# --- TRAVA DE SEGURANÇA PARA DATA (CORRIGIDA AQUI) ---
 def parse_data(texto_data):
-    try: return datetime.fromisoformat(texto_data)
-    except: return dateparser.parse(texto_data, languages=['pt'])
+    # Se a IA mandar None, número ou algo que não seja texto, retorna None e evita o erro
+    if not texto_data or not isinstance(texto_data, str):
+        return None
+    try: 
+        return datetime.fromisoformat(texto_data)
+    except: 
+        return dateparser.parse(texto_data, languages=['pt'])
 
 def checar_disponibilidade(data_inicio, duracao=30):
     data_fim = data_inicio + timedelta(minutes=duracao)
@@ -147,7 +153,8 @@ async def receber_webhook(request: Request):
 
             intencao = extrair_json(resposta_ia_raw)
             
-            if not intencao:
+            # TRAVA DE SEGURANÇA EXTRA (Garante que a IA mandou um dicionário)
+            if not intencao or not isinstance(intencao, dict):
                 print(f"⚠️ FALHA NO JSON DA IA: {resposta_ia_raw}")
                 intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir o dia e horário?"}
 
@@ -157,10 +164,12 @@ async def receber_webhook(request: Request):
             acao = intencao.get("acao")
 
             if acao == "agendar":
-                data_inicio = parse_data(intencao.get("horario", ""))
+                # Passa o valor direto para a função parse_data (ela sabe lidar se vier vazio)
+                data_inicio = parse_data(intencao.get("horario"))
                 servico = intencao.get("servico", "Corte Simples")
                 nome_ia = intencao.get("nome")
                 
+                # Se a IA não mandou o nome, tenta pescar no histórico
                 if not nome_ia:
                     for msg in reversed(historico):
                         if msg["role"] == "user" and len(msg["content"].split()) == 1 and msg["content"].istitle():
