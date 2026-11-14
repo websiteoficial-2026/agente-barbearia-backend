@@ -1,9 +1,10 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 import requests
 import os
 import json
 import re
 import sqlite3
+import asyncio # <-- Importação necessária para o sleep assíncrono
 from datetime import datetime, timedelta
 from openai import OpenAI
 from google_auth import get_calendar_service
@@ -64,9 +65,8 @@ def extrair_json(texto):
         except: pass
     return None
 
-# --- TRAVA DE SEGURANÇA PARA DATA (CORRIGIDA AQUI) ---
+# --- Trava de Segurança para Data ---
 def parse_data(texto_data):
-    # Se a IA mandar None, número ou algo que não seja texto, retorna None e evita o erro
     if not texto_data or not isinstance(texto_data, str):
         return None
     try: 
@@ -92,12 +92,23 @@ def enviar_whatsapp(numero_destino, texto_mensagem):
     payload = {"number": numero_destino, "text": texto_mensagem}
     try:
         requests.post(url, json=payload, headers=headers)
-        print(f"Status Evolução: 201")
+        print(f"Status Evolução: 201 | Enviado para {numero_destino}")
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
+# --- NOVA FUNÇÃO: Envio com atraso humano (Background) ---
+async def enviar_com_delay(numero_destino, texto_mensagem):
+    # Cálculo do tempo humano (0.05s por letra)
+    tempo_calculado = len(texto_mensagem) * 0.05
+    # Limita o tempo entre 2 e 8 segundos (para não travar a fila)
+    tempo_de_espera = min(max(tempo_calculado, 2.0), 8.0)
+    
+    print(f"⏳ Sofia está digitando... (aguardando {tempo_de_espera:.1f}s)")
+    await asyncio.sleep(tempo_de_espera) # Pausa sem travar o servidor
+    enviar_whatsapp(numero_destino, texto_mensagem)
+
 @app.post("/webhook/whatsapp")
-async def receber_webhook(request: Request):
+async def receber_webhook(request: Request, background_tasks: BackgroundTasks): # <-- Adicionado BackgroundTasks
     data = await request.json()
     
     if data.get("event") == "messages.upsert":
@@ -136,7 +147,7 @@ async def receber_webhook(request: Request):
             3. Se o cliente estiver apenas conversando, retorne:
             {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
             
-            IMPORTANTE: Use o histórico abaixo para saber o nome do cliente.
+            IMPORTANTE: Leia o histórico abaixo. Se o cliente já disse o nome dele, use esse nome. NUNCA use saudações como "Oi", "Olá" ou verbos como nome no campo "nome" do JSON.
             """
 
             messages_for_api = [{"role": "system", "content": system_prompt}]
@@ -148,12 +159,11 @@ async def receber_webhook(request: Request):
                 resposta_ia_raw = response.choices[0].message.content
             except Exception as e:
                 print(f"Erro na API da OpenAI: {e}")
-                enviar_whatsapp(numero_usuario, "Tive um problema de conexão. Pode repetir?")
+                background_tasks.add_task(enviar_com_delay, numero_usuario, "Tive um problema de conexão. Pode repetir?")
                 return {"status": "ok"}
 
             intencao = extrair_json(resposta_ia_raw)
             
-            # TRAVA DE SEGURANÇA EXTRA (Garante que a IA mandou um dicionário)
             if not intencao or not isinstance(intencao, dict):
                 print(f"⚠️ FALHA NO JSON DA IA: {resposta_ia_raw}")
                 intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir o dia e horário?"}
@@ -164,24 +174,30 @@ async def receber_webhook(request: Request):
             acao = intencao.get("acao")
 
             if acao == "agendar":
-                # Passa o valor direto para a função parse_data (ela sabe lidar se vier vazio)
                 data_inicio = parse_data(intencao.get("horario"))
                 servico = intencao.get("servico", "Corte Simples")
                 nome_ia = intencao.get("nome")
                 
-                # Se a IA não mandou o nome, tenta pescar no histórico
+                palavras_invalidas = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "tudo bem", "quero", "agendar", "sim", "não", "nao", "corte", "barba", "horario", "horário", "hoje", "amanha", "amanhã", "pode", "ser"]
+                
+                if nome_ia and str(nome_ia).lower() in palavras_invalidas:
+                    nome_ia = None
+                
                 if not nome_ia:
                     for msg in reversed(historico):
-                        if msg["role"] == "user" and len(msg["content"].split()) == 1 and msg["content"].istitle():
-                            nome_ia = msg["content"]
-                            break
+                        if msg["role"] == "user":
+                            texto_msg = msg["content"].strip()
+                            palavras = texto_msg.split()
+                            if 1 <= len(palavras) <= 2:
+                                if texto_msg.lower() not in palavras_invalidas and not any(c.isdigit() for c in texto_msg):
+                                    nome_ia = texto_msg.title()
+                                    break
                 
                 if not data_inicio:
                     resposta_final = "❌ Não consegui entender a data. Pode repetir? (ex: hoje às 10h)"
                 elif not nome_ia:
-                    resposta_final = "✅ Temos horário! Qual é o seu nome para eu confirmar o agendamento?"
+                    resposta_final = "✅ Temos horário disponível! Só preciso do seu nome para confirmar o agendamento."
                 else:
-                    # ISOLANDO O ERRO DO GOOGLE CALENDAR AQUI
                     try:
                         if checar_disponibilidade(data_inicio):
                             duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
@@ -195,11 +211,12 @@ async def receber_webhook(request: Request):
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
-            enviar_whatsapp(numero_usuario, resposta_final)
+            # USA O BACKGROUND TASKS PARA ENVIAR COM ATRASO E NÃO DAR TIMEOUT
+            background_tasks.add_task(enviar_com_delay, numero_usuario, resposta_final)
 
         except Exception as e:
             print(f"Erro GLOBAL ao processar: {e}")
-            try: enviar_whatsapp(numero_usuario, "⚠️ Ops, tive um problema interno. Pode repetir?")
+            try: background_tasks.add_task(enviar_com_delay, numero_usuario, "⚠️ Ops, tive um problema interno. Pode repetir?")
             except: pass
             
     return {"status": "ok"}
