@@ -173,14 +173,13 @@ def deletar_eventos_por_nome(nome_cliente):
 # --- FUNÇÃO DE ENVIO COM O FORMATO "text" ---
 def enviar_whatsapp(numero_destino, texto_mensagem):
     # Correção do 9º dígito brasileiro (se tiver 12 dígitos, adiciona o 9)
-    if len(numero_destino) == 12 and numero_destino.startswith("55"):
-        numero_destino = numero_destino[:4] + "9" + numero_destino[4:]
-        print(f"🔧 Número ajustado para: {numero_destino}")
-
+    def enviar_whatsapp(numero_destino, texto_mensagem):
+    # REMOVIDO O "CONSERTO" DO 9º DÍGITO. Agora usamos o número exato do webhook.
+    
     url = f"{EVOLUTION_API_URL.rstrip('/')}/message/sendText/{INSTANCE_NAME}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
     
-    # Formato simplificado que a sua API aceitou antes
+    # Usando o formato "text" que a sua API aceitou
     payload = {
         "number": numero_destino, 
         "text": texto_mensagem
