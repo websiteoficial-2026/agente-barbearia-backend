@@ -176,10 +176,7 @@ def enviar_whatsapp(numero_destino, texto_mensagem):
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
     
     # Formato simplificado que a sua API aceitou
-    payload = {
-        "number": numero_destino, 
-        "text": texto_mensagem
-    }
+    payload = {"number": f"{numero_destino}@s.whatsapp.net", "text": texto_mensagem}
     
     try:
         response = requests.post(url, json=payload, headers=headers)
