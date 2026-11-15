@@ -2,7 +2,6 @@ from fastapi import FastAPI, Request, BackgroundTasks
 import requests
 import os
 import json
-import re
 import sqlite3
 import asyncio
 from datetime import datetime, timedelta
@@ -24,18 +23,15 @@ client = OpenAI(api_key=api_key, base_url=base_url)
 
 CALENDAR_ID = 'dominio3004@gmail.com'
 
-# --- Banco de Dados (Substituindo o st.session_state) ---
+# --- Banco de Dados ---
 DB_PATH = "/data/barbearia.db"
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Tabela de mensagens
     cursor.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)')
-    # Tabela para guardar o NOME do cliente
     cursor.execute('CREATE TABLE IF NOT EXISTS user_profiles (session_id TEXT PRIMARY KEY, name TEXT)')
-    # Tabela para guardar o ID do evento no Google
     cursor.execute('CREATE TABLE IF NOT EXISTS appointments (session_id TEXT PRIMARY KEY, event_id TEXT)')
     conn.commit()
     conn.close()
@@ -138,7 +134,6 @@ def deletar_evento(event_id):
 def enviar_whatsapp(numero_destino, texto_mensagem):
     url = f"{EVOLUTION_API_URL.rstrip('/')}/message/sendText/{INSTANCE_NAME}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
-    # Formato exigido pela sua Evolution API
     payload = {"number": numero_destino, "text": texto_mensagem}
     try:
         requests.post(url, json=payload, headers=headers)
@@ -146,9 +141,7 @@ def enviar_whatsapp(numero_destino, texto_mensagem):
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
-# --- Envio com atraso humano ---
 async def enviar_com_delay(numero_destino, texto_mensagem):
-    # Cálculo humano baseado no tamanho da resposta
     tempo_calculado = len(texto_mensagem) * 0.08
     tempo_de_espera = min(max(tempo_calculado, 3.0), 20.0)
     print(f"⏳ Sofia está digitando... (aguardando {tempo_de_espera:.1f}s)")
@@ -179,7 +172,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             nome_atual = get_user_name(numero_usuario) or "Não identificado"
             
-            # --- PROMPT IDÊNTICO AO STREAMLIT ---
             system_prompt = f"""
             Você é a Sofia, recepcionista da Barbearia do João. Você é educada, humana e profissional.
             Data/Hora atual: {agora}.
@@ -197,9 +189,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             5. Para dúvidas ou conversas, retorne:
             {{"acao": "duvida", "resposta": "Sua resposta"}}
             6. O formato AAAA-MM-DDTHH:MM é de uso INTERNO do sistema. NUNCA peça nem mencione esse formato ao cliente.
-               Fale sempre de forma natural e simpática, como uma recepcionista de verdade
-               (ex: "Qual dia e horário ficam melhores para você?").
-               Se o cliente disser "amanhã às 14h", "sexta de manhã" etc., converta você mesma para a data correta usando a Data/Hora atual.
+               Fale sempre de forma natural e simpática.
             7. Se o cliente já escolheu o serviço mas ainda não disse dia e horário, use "acao": "duvida" e pergunte de forma natural qual dia e horário ele prefere.
             """
 
@@ -229,7 +219,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             resposta_final = ""
             acao = intencao.get("acao")
 
-            # --- LÓGICA IDÊNTICA AO STREAMLIT ---
             if acao == "informar_nome":
                 nome_extraido = intencao.get("nome")
                 save_user_name(numero_usuario, nome_extraido)
@@ -239,24 +228,25 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                 data_inicio = parse_data(intencao.get("horario"))
                 servico = intencao.get("servico")
                 
+                # TRAVA DE SEGURANÇA PARA O SERVIÇO
+                if not servico or not isinstance(servico, str):
+                    servico = "Corte Simples"
+                    
                 if not data_inicio:
                     resposta_final = "❌ Não consegui entender a data. Pode repetir? (ex: hoje às 10h)"
                 else:
                     if checar_disponibilidade(data_inicio):
-                        if servico:
-                            if not get_user_name(numero_usuario):
-                                resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')}. Só me diga seu nome para eu confirmar o agendamento."
-                            else:
-                                duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                                try:
-                                    evento_id = criar_evento(get_user_name(numero_usuario), servico, data_inicio, duracao)
-                                    save_event_id(numero_usuario, evento_id)
-                                    resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
-                                except Exception as e_cal:
-                                    print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
-                                    resposta_final = "⚠️ Problema técnico na agenda."
+                        if not get_user_name(numero_usuario):
+                            resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')}. Só me diga seu nome para eu confirmar o agendamento."
                         else:
-                            resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')} do dia {data_inicio.strftime('%d/%m')}. Qual serviço deseja?"
+                            duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
+                            try:
+                                evento_id = criar_evento(get_user_name(numero_usuario), servico, data_inicio, duracao)
+                                save_event_id(numero_usuario, evento_id)
+                                resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
+                            except Exception as e_cal:
+                                print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
+                                resposta_final = "⚠️ Problema técnico na agenda."
                     else:
                         resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado. Gostaria de tentar outro horário?"
 
@@ -265,7 +255,11 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                     resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
                 else:
                     dt_novo = parse_data(intencao.get("horario_novo"))
-                    servico = intencao.get("servico", "Corte Simples")
+                    servico = intencao.get("servico")
+                    
+                    # TRAVA DE SEGURANÇA PARA O SERVIÇO (Aqui estava o erro)
+                    if not servico or not isinstance(servico, str):
+                        servico = "Corte Simples"
                     
                     if not dt_novo:
                         resposta_final = "❌ Não consegui entender a nova data. Pode repetir?"
@@ -295,7 +289,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
-            # Envia a resposta com delay
             background_tasks.add_task(enviar_com_delay, numero_usuario, resposta_final)
 
         except Exception as e:
