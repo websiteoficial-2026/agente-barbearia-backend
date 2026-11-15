@@ -170,13 +170,27 @@ def deletar_eventos_por_nome(nome_cliente):
         print(f"Erro ao deletar por nome: {e}")
         return False
 
+# --- FUNÇÃO DE ENVIO ATUALIZADA ---
 def enviar_whatsapp(numero_destino, texto_mensagem):
+    # Correção do 9º dígito brasileiro (se tiver 12 dígitos, adiciona o 9)
+    if len(numero_destino) == 12 and numero_destino.startswith("55"):
+        numero_destino = numero_destino[:4] + "9" + numero_destino[4:]
+        print(f"🔧 Número ajustado para: {numero_destino}")
+
     url = f"{EVOLUTION_API_URL.rstrip('/')}/message/sendText/{INSTANCE_NAME}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
-    payload = {"number": numero_destino, "text": texto_mensagem}
+    
+    # Formato oficial da Evolution API v2
+    payload = {
+        "number": numero_destino, 
+        "textMessage": {
+            "text": texto_mensagem
+        }
+    }
+    
     try:
-        requests.post(url, json=payload, headers=headers)
-        print(f"Status Evolução: 201 | Enviado para {numero_destino}")
+        response = requests.post(url, json=payload, headers=headers)
+        print(f"Status Evolução: {response.status_code} | Resposta da API: {response.text}")
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
@@ -223,7 +237,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             nome_atual = get_user_name(numero_usuario) or "Não identificado"
             
-            # --- SYSTEM PROMPT ATUALIZADO ---
             system_prompt = f"""
             Você é a Sofia, recepcionista da Barbearia do João. Você é educada e profissional.
             Data/Hora atual: {agora}.
@@ -246,9 +259,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             
             4. Se o cliente PERGUNTAR se tem vaga em um dia/período (ex: "tem horário hoje?", "vocês têm amanhã?"), NÃO responda com "duvida" inventando uma resposta. Use a ação "verificar_horario" passando o horário que ele perguntou. Se ele não especificou o horário exato, use um horário padrão comercial (ex: 09:00) apenas para o sistema checar a agenda e te dar a resposta correta.
             
-            ATENÇÃO CRÍTICA: Analise todo o histórico da conversa. Se o cliente já disse o serviço ou o nome em mensagens anteriores, você DEVE incluí-los no JSON atual. 
-            Exemplo: Se ele disse "Quero mudar para 12h", você pediu o serviço, e ele respondeu "Corte simples", você deve retornar a ação "reagendar" com o horário das 12h, o serviço "Corte simples" e o nome dele.
-            
+            ATENÇÃO CRÍTICA: Analise todo o histórico da conversa. Se o cliente já disse o serviço ou o nome em mensagens anteriores, você DEVE incluí-los no JSON atual.
             O formato AAAA-MM-DDTHH:MM é de uso INTERNO. Fale de forma natural.
             """
 
@@ -284,7 +295,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                 save_user_name(numero_usuario, nome_ia)
                 nome_atual = nome_ia
 
-            # --- LÓGICA: MARCAR NOVO ---
             if acao == "verificar_horario":
                 data_inicio = parse_data(intencao.get("horario"))
                 servico = intencao.get("servico") or "Corte Simples"
@@ -307,7 +317,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                     else:
                         resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado. Gostaria de tentar outro horário?"
 
-            # --- LÓGICA: REAGENDAR ---
             elif acao == "reagendar":
                 if not get_user_name(numero_usuario):
                     resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
