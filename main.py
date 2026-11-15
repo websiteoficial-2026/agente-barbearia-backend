@@ -32,6 +32,7 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)')
     cursor.execute('CREATE TABLE IF NOT EXISTS user_profiles (session_id TEXT PRIMARY KEY, name TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS appointments (session_id TEXT PRIMARY KEY, event_id TEXT)')
     conn.commit()
     conn.close()
 
@@ -63,6 +64,21 @@ def get_user_name(session_id: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT name FROM user_profiles WHERE session_id = ?', (session_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def save_event_id(session_id: str, event_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR REPLACE INTO appointments (session_id, event_id) VALUES (?, ?)', (session_id, event_id))
+    conn.commit()
+    conn.close()
+
+def get_event_id(session_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT event_id FROM appointments WHERE session_id = ?', (session_id,))
     row = cursor.fetchone()
     conn.close()
     return row[0] if row else None
@@ -106,30 +122,30 @@ def criar_evento(nome, servico, data_inicio, duracao):
     evento_criado = service.events().insert(calendarId=CALENDAR_ID, body=evento_body).execute()
     return evento_criado['id']
 
-# --- NOVA FUNÇÃO: Deletar buscando pelo nome no Google Calendar ---
-def deletar_eventos_por_nome(nome_cliente):
+def deletar_evento(event_id):
     try:
         service = get_calendar_service()
-        # Busca eventos de hoje até daqui a 7 dias
+        service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+        return True
+    except Exception as e:
+        print(f"Erro ao deletar evento pelo ID: {e}")
+        return False
+
+# BUSCA MAIS AMPLA (DE ONTEM ATÉ 30 DIAS NO FUTURO)
+def deletar_eventos_por_nome(nome_cliente):
+    if not nome_cliente: return False
+    try:
+        service = get_calendar_service()
         agora = datetime.now()
-        timeMin = agora.isoformat() + "-03:00"
-        timeMax = (agora + timedelta(days=7)).isoformat() + "-03:00"
-        
-        eventos = service.events().list(
-            calendarId=CALENDAR_ID, 
-            timeMin=timeMin, 
-            timeMax=timeMax, 
-            singleEvents=True
-        ).execute().get('items', [])
-        
+        timeMin = (agora - timedelta(days=1)).isoformat() + "-03:00"
+        timeMax = (agora + timedelta(days=30)).isoformat() + "-03:00"
+        eventos = service.events().list(calendarId=CALENDAR_ID, timeMin=timeMin, timeMax=timeMax, singleEvents=True).execute().get('items', [])
         deletou = False
         for evento in eventos:
-            # Se o nome do cliente estiver no título do evento
             if nome_cliente.lower() in evento.get('summary', '').lower():
-                print(f"🗑️ Deletando evento antigo: {evento['summary']}")
+                print(f"🗑️ Deletando evento antigo (fallback nome): {evento['summary']}")
                 service.events().delete(calendarId=CALENDAR_ID, eventId=evento['id']).execute()
                 deletou = True
-                
         return deletou
     except Exception as e:
         print(f"Erro ao deletar por nome: {e}")
@@ -176,20 +192,26 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             nome_atual = get_user_name(numero_usuario) or "Não identificado"
             
-            # PROMPT ATUALIZADO PARA FORÇAR O REAGENDAMENTO
+            # PROMPT REFEITO: A IA DEVE JUNTAR AS PEÇAS DO HISTÓRICO
             system_prompt = f"""
-            Você é a Sofia, recepcionista da Barbearia do João.
+            Você é a Sofia, recepcionista da Barbearia do João. Você é educada e profissional.
             Data/Hora atual: {agora}.
             Nome do cliente: {nome_atual}
-            Serviços: Corte Simples (30min), Corte+Barba (45min), Barba (20min).
+            Serviços: Corte Simples, Corte+Barba, Barba.
             
-            REGRAS (Responda SEMPRE em formato JSON):
-            1. Se o nome for "Não identificado", pergunte o nome: {{"acao": "informar_nome", "nome": "Nome", "resposta": "Sua saudação"}}
-            2. Se o cliente quiser MARCAR um horário novo: {{"acao": "agendar", "horario": "AAAA-MM-DDTHH:MM", "servico": "nome"}}
-            3. Se o cliente JÁ TEM um horário e disser que quer MUDAR, REMARCAR ou ALTERAR: {{"acao": "reagendar", "horario_novo": "AAAA-MM-DDTHH:MM", "servico": "nome"}}
-            4. Se for conversa: {{"acao": "duvida", "resposta": "Sua resposta"}}
+            REGRAS IMPORTANTES (Responda SEMPRE em JSON):
+            1. Se o cliente quiser MARCAR um horário: 
+            {{"acao": "verificar_horario", "horario": "AAAA-MM-DDTHH:MM", "servico": "Nome do Servico", "nome": "Nome do Cliente"}}
             
-            IMPORTANTE: O formato AAAA-MM-DDTHH:MM é interno. NUNCA peça esse formato ao cliente.
+            2. Se o cliente quiser MUDAR/REMARCAR um horário:
+            {{"acao": "reagendar", "horario_novo": "AAAA-MM-DDTHH:MM", "servico": "Nome do Servico", "nome": "Nome do Cliente"}}
+            
+            3. Se for só conversa, dúvidas ou você precisar de mais informações:
+            {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
+            
+            ATENÇÃO CRÍTICA: Se o cliente estiver no meio de um agendamento (já disse o horário, o serviço ou o nome em mensagens anteriores) e agora enviar a peça que faltava (ex: só o nome "Jovena"), você DEVE juntar todas as informações do histórico e retornar a ação "verificar_horario" ou "reagendar" preenchendo TODOS os campos.
+            
+            O formato AAAA-MM-DDTHH:MM é de uso INTERNO. Fale de forma natural com o cliente.
             """
 
             messages_for_api = [{"role": "system", "content": system_prompt}]
@@ -211,37 +233,42 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             intencao = extrair_json(resposta_ia_raw)
             
             if not intencao or not isinstance(intencao, dict):
-                intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir?"}
+                print(f"⚠️ FALHA NO JSON DA IA: {resposta_ia_raw}")
+                intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir o dia e horário?"}
 
             save_message(numero_usuario, "assistant", json.dumps(intencao))
             resposta_final = ""
             acao = intencao.get("acao")
+            
+            # Extrai nome novo se a IA mandou (junto com a intenção)
+            nome_ia = intencao.get("nome")
+            if nome_ia:
+                save_user_name(numero_usuario, nome_ia)
 
-            if acao == "informar_nome":
-                nome_extraido = intencao.get("nome")
-                save_user_name(numero_usuario, nome_extraido)
-                resposta_final = intencao.get("resposta", f"Prazer em te conhecer, {nome_extraido}!")
-
-            elif acao == "agendar":
+            # --- LOGICA: MARCAR HORÁRIO NOVO ---
+            if acao == "verificar_horario":
                 data_inicio = parse_data(intencao.get("horario"))
                 servico = intencao.get("servico") or "Corte Simples"
                 
                 if not data_inicio:
                     resposta_final = "❌ Não consegui entender a data. Pode repetir? (ex: hoje às 10h)"
-                elif not get_user_name(numero_usuario):
-                    resposta_final = f"✅ Temos horário às {data_inicio.strftime('%H:%M')}. Qual o seu nome?"
                 else:
                     if checar_disponibilidade(data_inicio):
-                        duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                        try:
-                            criar_evento(get_user_name(numero_usuario), servico, data_inicio, duracao)
-                            resposta_final = f"✅ Agendado! {servico} confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
-                        except Exception as e_cal:
-                            print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
-                            resposta_final = "⚠️ Problema técnico na agenda."
+                        if not get_user_name(numero_usuario):
+                            resposta_final = f"✅ Temos horário às {data_inicio.strftime('%H:%M')}. Só me diga seu nome para eu confirmar o agendamento."
+                        else:
+                            duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
+                            try:
+                                evento_id = criar_evento(get_user_name(numero_usuario), servico, data_inicio, duracao)
+                                save_event_id(numero_usuario, evento_id)
+                                resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
+                            except Exception as e_cal:
+                                print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
+                                resposta_final = "⚠️ Problema técnico na agenda."
                     else:
-                        resposta_final = f"❌ O horário das {data_inicio.strftime('%H:%M')} está ocupado."
+                        resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado. Gostaria de tentar outro horário?"
 
+            # --- LOGICA: REAGENDAR ---
             elif acao == "reagendar":
                 if not get_user_name(numero_usuario):
                     resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
@@ -254,16 +281,25 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                     else:
                         duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
                         
-                        # O SEGREDO: Deleta no Google Calendar buscando pelo nome, independente do banco
-                        print("Tentando deletar eventos antigos...")
-                        deletou = deletar_eventos_por_nome(get_user_name(numero_usuario))
+                        # Tenta deletar pelo ID, se falhar, deleta pelo Nome (Fallback)
+                        old_event_id = get_event_id(numero_usuario)
+                        deletou = False
+                        
+                        if old_event_id:
+                            if deletar_evento(old_event_id):
+                                deletou = True
+                        
+                        if not deletou:
+                            print("⚠️ ID não encontrado no banco. Tentando deletar pelo nome...")
+                            deletou = deletar_eventos_por_nome(get_user_name(numero_usuario))
 
                         if not deletou:
                             resposta_final = "Não localizei seu agendamento anterior na agenda. Vamos fazer um novo?"
                         else:
                             if checar_disponibilidade(dt_novo, duracao):
                                 try:
-                                    criar_evento(get_user_name(numero_usuario), servico, dt_novo, duracao)
+                                    novo_evento_id = criar_evento(get_user_name(numero_usuario), servico, dt_novo, duracao)
+                                    save_event_id(numero_usuario, novo_evento_id)
                                     resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi reagendado para {dt_novo.strftime('%d/%m às %H:%M')}."
                                 except Exception as e_cal:
                                     print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
