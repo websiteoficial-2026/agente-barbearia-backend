@@ -36,7 +36,26 @@ def init_db():
     conn.commit()
     conn.close()
 
+def limpar_historico_antigo(dias=30):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"DELETE FROM messages WHERE timestamp < datetime('now', '-{dias} days', '-3 hours')")
+        deletados = cursor.rowcount
+        conn.commit()
+        if deletados > 0:
+            print(f"🧹 Limpeza de rotina: {deletados} mensagens antigas apagadas.")
+    except Exception as e:
+        print(f"❌ Erro ao limpar o banco: {e}")
+    finally:
+        conn.close()
+
 init_db()
+
+@app.on_event("startup")
+async def startup_event():
+    print("🚀 Iniciando o servidor...")
+    limpar_historico_antigo(30)
 
 def get_chat_history(session_id: str, limit: int = 10):
     conn = sqlite3.connect(DB_PATH)
@@ -131,11 +150,8 @@ def deletar_evento(event_id):
         print(f"Erro ao deletar evento pelo ID: {e}")
         return False
 
-# BUSCA MAIS AMPLA COM LOGS DE DIAGNÓSTICO
 def deletar_eventos_por_nome(nome_cliente):
-    if not nome_cliente:
-        print("⚠️ Busca por nome abortada: nome_cliente vazio.")
-        return False
+    if not nome_cliente: return False
     try:
         service = get_calendar_service()
         agora = datetime.now()
@@ -143,14 +159,10 @@ def deletar_eventos_por_nome(nome_cliente):
         timeMax = (agora + timedelta(days=30)).isoformat() + "-03:00"
         eventos = service.events().list(calendarId=CALENDAR_ID, timeMin=timeMin, timeMax=timeMax, singleEvents=True).execute().get('items', [])
         
-        print(f"🔍 Buscando eventos para deletar com o nome: '{nome_cliente}'. Total de eventos encontrados na agenda: {len(eventos)}")
-        
         deletou = False
         for evento in eventos:
-            titulo = evento.get('summary', '')
-            print(f"   - Analisando evento: '{titulo}'")
-            if nome_cliente.lower() in titulo.lower():
-                print(f"🗑️ Deletando evento antigo (fallback nome): {titulo}")
+            if nome_cliente.lower() in evento.get('summary', '').lower():
+                print(f"🗑️ Deletando evento antigo (fallback nome): {evento['summary']}")
                 service.events().delete(calendarId=CALENDAR_ID, eventId=evento['id']).execute()
                 deletou = True
         return deletou
@@ -175,6 +187,18 @@ async def enviar_com_delay(numero_destino, texto_mensagem):
     await asyncio.sleep(tempo_de_espera)
     enviar_whatsapp(numero_destino, texto_mensagem)
 
+# --- ENDPOINT DE MANUTENÇÃO ---
+@app.get("/manutencao/limpar-banco")
+async def limpar_banco_endpoint(senha: str = ""):
+    if senha != os.getenv("EVOLUTION_API_KEY"):
+        return {"status": "erro", "mensagem": "Acesso negado."}
+    try:
+        limpar_historico_antigo(30)
+        return {"status": "sucesso", "mensagem": "Banco de dados limpo."}
+    except Exception as e:
+        return {"status": "erro", "mensagem": str(e)}
+
+# --- WEBHOOK PRINCIPAL ---
 @app.post("/webhook/whatsapp")
 async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
@@ -199,12 +223,16 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             nome_atual = get_user_name(numero_usuario) or "Não identificado"
             
-            # PROMPT REFORÇADO PARA JUNTAR INFORMAÇÕES
+            # --- SYSTEM PROMPT ATUALIZADO ---
             system_prompt = f"""
             Você é a Sofia, recepcionista da Barbearia do João. Você é educada e profissional.
             Data/Hora atual: {agora}.
             Nome do cliente no sistema: {nome_atual}
-            Serviços: Corte Simples, Corte+Barba, Barba.
+            
+            INFORMAÇÕES DA BARBEARIA:
+            - Serviços: Corte Masculino (R$30), Corte Feminino (R$40), Corte+Barba (R$50), Barba (R$20).
+            - Funcionamento: Segunda a Sábado, das 09:00 às 19:00. Fechado aos Domingos.
+            - Pagamento: Aceitamos Cartão de Crédito, Débito e Pix.
             
             REGRAS IMPORTANTES (Responda SEMPRE em formato JSON):
             1. Se o cliente quiser MARCAR um horário novo: 
@@ -213,7 +241,10 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             2. Se o cliente quiser MUDAR/REMARCAR um horário:
             {{"acao": "reagendar", "horario_novo": "AAAA-MM-DDTHH:MM", "servico": "Nome do Servico", "nome": "Nome do Cliente"}}
             
-            3. Se for só conversa: {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
+            3. Se for apenas conversa, dúvida sobre preços, pagamentos ou horários de funcionamento: 
+            {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
+            
+            4. Se o cliente PERGUNTAR se tem vaga em um dia/período (ex: "tem horário hoje?", "vocês têm amanhã?"), NÃO responda com "duvida" inventando uma resposta. Use a ação "verificar_horario" passando o horário que ele perguntou. Se ele não especificou o horário exato, use um horário padrão comercial (ex: 09:00) apenas para o sistema checar a agenda e te dar a resposta correta.
             
             ATENÇÃO CRÍTICA: Analise todo o histórico da conversa. Se o cliente já disse o serviço ou o nome em mensagens anteriores, você DEVE incluí-los no JSON atual. 
             Exemplo: Se ele disse "Quero mudar para 12h", você pediu o serviço, e ele respondeu "Corte simples", você deve retornar a ação "reagendar" com o horário das 12h, o serviço "Corte simples" e o nome dele.
@@ -248,11 +279,10 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             resposta_final = ""
             acao = intencao.get("acao")
             
-            # Se a IA mandou um nome no JSON (seja em agendar ou reagendar), salva no banco
             nome_ia = intencao.get("nome")
             if nome_ia and isinstance(nome_ia, str) and len(nome_ia) > 2:
                 save_user_name(numero_usuario, nome_ia)
-                nome_atual = nome_ia # Atualiza para usar abaixo
+                nome_atual = nome_ia
 
             # --- LÓGICA: MARCAR NOVO ---
             if acao == "verificar_horario":
@@ -302,7 +332,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                             deletou = deletar_eventos_por_nome(get_user_name(numero_usuario))
 
                         if not deletou:
-                            # Se não deletou nada, avisa mas cria o novo para não perder a venda
                             try:
                                 novo_evento_id = criar_evento(get_user_name(numero_usuario), servico, dt_novo, duracao)
                                 save_event_id(numero_usuario, novo_evento_id)
