@@ -175,10 +175,7 @@ def enviar_whatsapp(numero_destino, texto_mensagem):
     url = f"{EVOLUTION_API_URL.rstrip('/')}/message/sendText/{INSTANCE_NAME}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
     
-    # Se o número já vier com @s.whatsapp.net ou @lid, não faz nada. Se vier limpo, adiciona o @s.whatsapp.net
-    if "@" not in numero_destino:
-        numero_destino = f"{numero_destino}@s.whatsapp.net"
-        
+    # O numero_destino agora virá com o @lid ou @s.whatsapp.net completo
     payload = {"number": numero_destino, "text": texto_mensagem}
     
     try:
@@ -214,14 +211,13 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
         try:
             message_data = data["data"]
             
-            # --- CORREÇÃO CRUCIAL AQUI (@lid vs @s.whatsapp.net) ---
-            # O remoteJidAlt traz o número real no formato correto
-            remote_jid_alt = message_data["key"].get("remoteJidAlt")
-            remote_jid = remote_jid_alt if remote_jid_alt else message_data["key"]["remoteJid"]
+            # --- CORREÇÃO DEFINITIVA: JID para envio vs ID para banco de dados ---
+            jid_envio = message_data["key"]["remoteJid"] # Mantém o @lid original para o envio
+            jid_alt = message_data["key"].get("remoteJidAlt") # Pega o @s.whatsapp.net para o banco
             
-            # Extrai o número limpo para o banco de dados
-            numero_usuario = remote_jid.split("@")[0]
-            # -------------------------------------------------------
+            # Se o Alt existir, usamos ele para pegar o número limpo. Senão, limpamos o original.
+            numero_usuario = jid_alt.split("@")[0] if jid_alt else jid_envio.split("@")[0]
+            # -------------------------------------------------------------------
             
             if message_data["key"].get("fromMe"): return {"status": "ok"}
 
@@ -276,7 +272,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                 resposta_ia_raw = response.choices[0].message.content
             except Exception as e:
                 print(f"Erro na API da OpenAI: {e}")
-                background_tasks.add_task(enviar_com_delay, remote_jid, "Tive um problema de conexão. Pode repetir?")
+                background_tasks.add_task(enviar_com_delay, jid_envio, "Tive um problema de conexão. Pode repetir?")
                 return {"status": "ok"}
 
             intencao = extrair_json(resposta_ia_raw)
@@ -362,14 +358,14 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
-            # Envia para o remote_jid completo que extraímos no início (seja @s.whatsapp.net ou @lid)
-            background_tasks.add_task(enviar_com_delay, remote_jid, resposta_final)
+            # ENVIA PARA O JID ORIGINAL (O @LID)
+            background_tasks.add_task(enviar_com_delay, jid_envio, resposta_final)
 
         except Exception as e:
             print(f"Erro GLOBAL ao processar: {e}")
             try: 
-                fallback_jid = remote_jid if 'remote_jid' in locals() else numero_usuario
-                background_tasks.add_task(enviar_com_delay, fallback_jid, "⚠️ Ops, tive um problema interno. Pode repetir?")
+                fallback = jid_envio if 'jid_envio' in locals() else numero_usuario
+                background_tasks.add_task(enviar_com_delay, fallback, "⚠️ Ops, tive um problema interno. Pode repetir?")
             except: pass
             
     return {"status": "ok"}
