@@ -131,19 +131,26 @@ def deletar_evento(event_id):
         print(f"Erro ao deletar evento pelo ID: {e}")
         return False
 
-# BUSCA MAIS AMPLA (DE ONTEM ATÉ 30 DIAS NO FUTURO)
+# BUSCA MAIS AMPLA COM LOGS DE DIAGNÓSTICO
 def deletar_eventos_por_nome(nome_cliente):
-    if not nome_cliente: return False
+    if not nome_cliente:
+        print("⚠️ Busca por nome abortada: nome_cliente vazio.")
+        return False
     try:
         service = get_calendar_service()
         agora = datetime.now()
         timeMin = (agora - timedelta(days=1)).isoformat() + "-03:00"
         timeMax = (agora + timedelta(days=30)).isoformat() + "-03:00"
         eventos = service.events().list(calendarId=CALENDAR_ID, timeMin=timeMin, timeMax=timeMax, singleEvents=True).execute().get('items', [])
+        
+        print(f"🔍 Buscando eventos para deletar com o nome: '{nome_cliente}'. Total de eventos encontrados na agenda: {len(eventos)}")
+        
         deletou = False
         for evento in eventos:
-            if nome_cliente.lower() in evento.get('summary', '').lower():
-                print(f"🗑️ Deletando evento antigo (fallback nome): {evento['summary']}")
+            titulo = evento.get('summary', '')
+            print(f"   - Analisando evento: '{titulo}'")
+            if nome_cliente.lower() in titulo.lower():
+                print(f"🗑️ Deletando evento antigo (fallback nome): {titulo}")
                 service.events().delete(calendarId=CALENDAR_ID, eventId=evento['id']).execute()
                 deletou = True
         return deletou
@@ -184,7 +191,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             if not texto_recebido:
                  texto_recebido = message_data.get("message", {}).get("extendedTextMessage", {}).get("text", "")
 
-            print(f"Mensagem de {numero_usuario}: {texto_recebido}")
+            print(f"\n--- Nova Mensagem de {numero_usuario}: {texto_recebido} ---")
 
             historico = get_chat_history(numero_usuario)
             save_message(numero_usuario, "user", texto_recebido)
@@ -192,26 +199,26 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             nome_atual = get_user_name(numero_usuario) or "Não identificado"
             
-            # PROMPT REFEITO: A IA DEVE JUNTAR AS PEÇAS DO HISTÓRICO
+            # PROMPT REFORÇADO PARA JUNTAR INFORMAÇÕES
             system_prompt = f"""
             Você é a Sofia, recepcionista da Barbearia do João. Você é educada e profissional.
             Data/Hora atual: {agora}.
-            Nome do cliente: {nome_atual}
+            Nome do cliente no sistema: {nome_atual}
             Serviços: Corte Simples, Corte+Barba, Barba.
             
-            REGRAS IMPORTANTES (Responda SEMPRE em JSON):
-            1. Se o cliente quiser MARCAR um horário: 
+            REGRAS IMPORTANTES (Responda SEMPRE em formato JSON):
+            1. Se o cliente quiser MARCAR um horário novo: 
             {{"acao": "verificar_horario", "horario": "AAAA-MM-DDTHH:MM", "servico": "Nome do Servico", "nome": "Nome do Cliente"}}
             
             2. Se o cliente quiser MUDAR/REMARCAR um horário:
             {{"acao": "reagendar", "horario_novo": "AAAA-MM-DDTHH:MM", "servico": "Nome do Servico", "nome": "Nome do Cliente"}}
             
-            3. Se for só conversa, dúvidas ou você precisar de mais informações:
-            {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
+            3. Se for só conversa: {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
             
-            ATENÇÃO CRÍTICA: Se o cliente estiver no meio de um agendamento (já disse o horário, o serviço ou o nome em mensagens anteriores) e agora enviar a peça que faltava (ex: só o nome "Jovena"), você DEVE juntar todas as informações do histórico e retornar a ação "verificar_horario" ou "reagendar" preenchendo TODOS os campos.
+            ATENÇÃO CRÍTICA: Analise todo o histórico da conversa. Se o cliente já disse o serviço ou o nome em mensagens anteriores, você DEVE incluí-los no JSON atual. 
+            Exemplo: Se ele disse "Quero mudar para 12h", você pediu o serviço, e ele respondeu "Corte simples", você deve retornar a ação "reagendar" com o horário das 12h, o serviço "Corte simples" e o nome dele.
             
-            O formato AAAA-MM-DDTHH:MM é de uso INTERNO. Fale de forma natural com o cliente.
+            O formato AAAA-MM-DDTHH:MM é de uso INTERNO. Fale de forma natural.
             """
 
             messages_for_api = [{"role": "system", "content": system_prompt}]
@@ -231,6 +238,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                 return {"status": "ok"}
 
             intencao = extrair_json(resposta_ia_raw)
+            print(f"Intenção da IA: {intencao}")
             
             if not intencao or not isinstance(intencao, dict):
                 print(f"⚠️ FALHA NO JSON DA IA: {resposta_ia_raw}")
@@ -240,12 +248,13 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             resposta_final = ""
             acao = intencao.get("acao")
             
-            # Extrai nome novo se a IA mandou (junto com a intenção)
+            # Se a IA mandou um nome no JSON (seja em agendar ou reagendar), salva no banco
             nome_ia = intencao.get("nome")
-            if nome_ia:
+            if nome_ia and isinstance(nome_ia, str) and len(nome_ia) > 2:
                 save_user_name(numero_usuario, nome_ia)
+                nome_atual = nome_ia # Atualiza para usar abaixo
 
-            # --- LOGICA: MARCAR HORÁRIO NOVO ---
+            # --- LÓGICA: MARCAR NOVO ---
             if acao == "verificar_horario":
                 data_inicio = parse_data(intencao.get("horario"))
                 servico = intencao.get("servico") or "Corte Simples"
@@ -268,7 +277,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                     else:
                         resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado. Gostaria de tentar outro horário?"
 
-            # --- LOGICA: REAGENDAR ---
+            # --- LÓGICA: REAGENDAR ---
             elif acao == "reagendar":
                 if not get_user_name(numero_usuario):
                     resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
@@ -281,7 +290,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                     else:
                         duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
                         
-                        # Tenta deletar pelo ID, se falhar, deleta pelo Nome (Fallback)
                         old_event_id = get_event_id(numero_usuario)
                         deletou = False
                         
@@ -290,11 +298,17 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                                 deletou = True
                         
                         if not deletou:
-                            print("⚠️ ID não encontrado no banco. Tentando deletar pelo nome...")
+                            print("⚠️ ID não encontrado no banco ou falhou. Tentando deletar pelo nome...")
                             deletou = deletar_eventos_por_nome(get_user_name(numero_usuario))
 
                         if not deletou:
-                            resposta_final = "Não localizei seu agendamento anterior na agenda. Vamos fazer um novo?"
+                            # Se não deletou nada, avisa mas cria o novo para não perder a venda
+                            try:
+                                novo_evento_id = criar_evento(get_user_name(numero_usuario), servico, dt_novo, duracao)
+                                save_event_id(numero_usuario, novo_evento_id)
+                                resposta_final = f"⚠️ Não achei o agendamento antigo para apagar, mas criei o novo! {servico} para {dt_novo.strftime('%d/%m às %H:%M')}."
+                            except:
+                                resposta_final = "⚠️ Tive um problema técnico na agenda."
                         else:
                             if checar_disponibilidade(dt_novo, duracao):
                                 try:
