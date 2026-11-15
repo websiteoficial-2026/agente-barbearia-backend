@@ -24,7 +24,7 @@ client = OpenAI(api_key=api_key, base_url=base_url)
 
 CALENDAR_ID = 'dominio3004@gmail.com'
 
-# --- Banco de Dados ---
+# --- Banco de Dados (Substituindo o st.session_state) ---
 DB_PATH = "/data/barbearia.db"
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
@@ -33,7 +33,9 @@ def init_db():
     cursor = conn.cursor()
     # Tabela de mensagens
     cursor.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)')
-    # Tabela NOVA para guardar o ID do evento no Google
+    # Tabela para guardar o NOME do cliente
+    cursor.execute('CREATE TABLE IF NOT EXISTS user_profiles (session_id TEXT PRIMARY KEY, name TEXT)')
+    # Tabela para guardar o ID do evento no Google
     cursor.execute('CREATE TABLE IF NOT EXISTS appointments (session_id TEXT PRIMARY KEY, event_id TEXT)')
     conn.commit()
     conn.close()
@@ -55,7 +57,21 @@ def save_message(session_id: str, role: str, content: str):
     conn.commit()
     conn.close()
 
-# --- Funções para Gerenciar Eventos no Banco ---
+def save_user_name(session_id: str, name: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR REPLACE INTO user_profiles (session_id, name) VALUES (?, ?)', (session_id, name))
+    conn.commit()
+    conn.close()
+
+def get_user_name(session_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT name FROM user_profiles WHERE session_id = ?', (session_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
 def save_event_id(session_id: str, event_id: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -101,8 +117,14 @@ def checar_disponibilidade(data_inicio, duracao=30):
 def criar_evento(nome, servico, data_inicio, duracao):
     data_fim = data_inicio + timedelta(minutes=duracao)
     service = get_calendar_service()
-    evento_body = {'summary': f"Agendamento: {nome} - {servico}", 'start': {'dateTime': data_inicio.isoformat(), 'timeZone': 'America/Sao_Paulo'}, 'end': {'dateTime': data_fim.isoformat(), 'timeZone': 'America/Sao_Paulo'}}
-    return service.events().insert(calendarId=CALENDAR_ID, body=evento_body).execute()['id']
+    titulo_evento = f"Agendamento: {nome} - {servico}"
+    evento_body = {
+        'summary': titulo_evento,
+        'start': {'dateTime': data_inicio.isoformat(), 'timeZone': 'America/Sao_Paulo'},
+        'end': {'dateTime': data_fim.isoformat(), 'timeZone': 'America/Sao_Paulo'},
+    }
+    evento_criado = service.events().insert(calendarId=CALENDAR_ID, body=evento_body).execute()
+    return evento_criado['id']
 
 def deletar_evento(event_id):
     try:
@@ -116,6 +138,7 @@ def deletar_evento(event_id):
 def enviar_whatsapp(numero_destino, texto_mensagem):
     url = f"{EVOLUTION_API_URL.rstrip('/')}/message/sendText/{INSTANCE_NAME}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
+    # Formato exigido pela sua Evolution API
     payload = {"number": numero_destino, "text": texto_mensagem}
     try:
         requests.post(url, json=payload, headers=headers)
@@ -123,9 +146,11 @@ def enviar_whatsapp(numero_destino, texto_mensagem):
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
+# --- Envio com atraso humano ---
 async def enviar_com_delay(numero_destino, texto_mensagem):
-    tempo_calculado = len(texto_mensagem) * 0.05
-    tempo_de_espera = min(max(tempo_calculado, 2.0), 8.0)
+    # Cálculo humano baseado no tamanho da resposta
+    tempo_calculado = len(texto_mensagem) * 0.08
+    tempo_de_espera = min(max(tempo_calculado, 3.0), 20.0)
     print(f"⏳ Sofia está digitando... (aguardando {tempo_de_espera:.1f}s)")
     await asyncio.sleep(tempo_de_espera)
     enviar_whatsapp(numero_destino, texto_mensagem)
@@ -151,20 +176,31 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             historico = get_chat_history(numero_usuario)
             save_message(numero_usuario, "user", texto_recebido)
 
-            agora = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            nome_atual = get_user_name(numero_usuario) or "Não identificado"
             
-            # PROMPT ENSINANDO A IA A DIFERENCIAR AGENDAR DE REAGENDAR
+            # --- PROMPT IDÊNTICO AO STREAMLIT ---
             system_prompt = f"""
-            Você é a Sofia, recepcionista da Barbearia do João.
+            Você é a Sofia, recepcionista da Barbearia do João. Você é educada, humana e profissional.
             Data/Hora atual: {agora}.
+            Nome do cliente: {nome_atual}
             Serviços: Corte Simples (30min, R$30), Corte+Barba (45min, R$50), Barba (20min, R$20).
             
-            REGRAS (Responda APENAS JSON):
-            1. Se o cliente quiser marcar um horário novo: {{"acao": "agendar", "nome": "Nome", "servico": "Corte Simples", "horario": "YYYY-MM-DDTHH:MM"}}
-            2. Se o cliente já tem um horário e pedir para MUDAR ou REMARCAR: {{"acao": "reagendar", "nome": "Nome", "servico": "Corte Simples", "horario_novo": "YYYY-MM-DDTHH:MM"}}
-            3. Se for só conversa: {{"acao": "duvida", "resposta": "Sua resposta"}}
-            
-            CRÍTICO: Só preencha o campo "nome" se o cliente disser explicitamente. Use o histórico para saber o nome e o serviço se ele já falou antes.
+            REGRAS IMPORTANTES (Responda SEMPRE em formato JSON):
+            1. Se o nome for "Não identificado", pergunte o nome de forma educada ANTES de prosseguir.
+            2. Se o cliente informar o nome, retorne: 
+            {{"acao": "informar_nome", "nome": "Nome", "resposta": "Sua saudação usando o histórico para continuar o assunto"}}
+            3. Se o cliente perguntar por um horário (ex: "tem 14h?"), retorne:
+            {{"acao": "verificar_horario", "horario": "AAAA-MM-DDTHH:MM", "servico": "nome do serviço se ele citou, senão deixe nulo"}}
+            4. Se o cliente pedir para mudar um agendamento feito, retorne:
+            {{"acao": "reagendar", "horario_novo": "AAAA-MM-DDTHH:MM", "servico": "nome"}}
+            5. Para dúvidas ou conversas, retorne:
+            {{"acao": "duvida", "resposta": "Sua resposta"}}
+            6. O formato AAAA-MM-DDTHH:MM é de uso INTERNO do sistema. NUNCA peça nem mencione esse formato ao cliente.
+               Fale sempre de forma natural e simpática, como uma recepcionista de verdade
+               (ex: "Qual dia e horário ficam melhores para você?").
+               Se o cliente disser "amanhã às 14h", "sexta de manhã" etc., converta você mesma para a data correta usando a Data/Hora atual.
+            7. Se o cliente já escolheu o serviço mas ainda não disse dia e horário, use "acao": "duvida" e pergunte de forma natural qual dia e horário ele prefere.
             """
 
             messages_for_api = [{"role": "system", "content": system_prompt}]
@@ -172,7 +208,11 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             messages_for_api.append({"role": "user", "content": texto_recebido})
 
             try:
-                response = client.chat.completions.create(model=model_name, messages=messages_for_api)
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=messages_for_api, 
+                    response_format={"type": "json_object"}
+                )
                 resposta_ia_raw = response.choices[0].message.content
             except Exception as e:
                 print(f"Erro na API da OpenAI: {e}")
@@ -182,72 +222,85 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             intencao = extrair_json(resposta_ia_raw)
             
             if not intencao or not isinstance(intencao, dict):
-                intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir?"}
+                print(f"⚠️ FALHA NO JSON DA IA: {resposta_ia_raw}")
+                intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir o dia e horário?"}
 
             save_message(numero_usuario, "assistant", json.dumps(intencao))
-            
             resposta_final = ""
             acao = intencao.get("acao")
-            servico = intencao.get("servico", "Corte Simples")
-            nome_ia = intencao.get("nome")
-            
-            # --- LÓGICA DE AGENDAR (NOVO) ---
-            if acao == "agendar":
+
+            # --- LÓGICA IDÊNTICA AO STREAMLIT ---
+            if acao == "informar_nome":
+                nome_extraido = intencao.get("nome")
+                save_user_name(numero_usuario, nome_extraido)
+                resposta_final = intencao.get("resposta", f"Prazer em te conhecer, {nome_extraido}! Como posso ajudar?")
+
+            elif acao == "verificar_horario":
                 data_inicio = parse_data(intencao.get("horario"))
+                servico = intencao.get("servico")
                 
                 if not data_inicio:
-                    resposta_final = "❌ Não entendi a data. Pode repetir?"
-                elif not nome_ia:
-                    resposta_final = "✅ Temos horário! Qual o seu nome para confirmar?"
+                    resposta_final = "❌ Não consegui entender a data. Pode repetir? (ex: hoje às 10h)"
                 else:
-                    try:
-                        if checar_disponibilidade(data_inicio):
-                            duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                            evento_id = criar_evento(nome_ia, servico, data_inicio, duracao)
-                            save_event_id(numero_usuario, evento_id) # Salva o ID no banco!
-                            resposta_final = f"✅ Agendado! {servico} confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
-                        else:
-                            resposta_final = f"❌ O horário das {data_inicio.strftime('%H:%M')} está ocupado."
-                    except Exception as e_cal:
-                        print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
-                        resposta_final = "⚠️ Problema técnico na agenda."
-
-            # --- LÓGICA DE REAGENDAR (NOVO - APAGA O ANTIGO E CRIA O NOVO) ---
-            elif acao == "reagendar":
-                data_nova = parse_data(intencao.get("horario_novo"))
-                evento_antigo_id = get_event_id(numero_usuario)
-                
-                if not data_nova:
-                    resposta_final = "❌ Não entendi a nova data. Pode repetir?"
-                elif not evento_antigo_id:
-                    resposta_final = "Não encontrei um agendamento anterior no seu nome. Vamos criar um novo?"
-                else:
-                    try:
-                        # 1. Deleta o antigo
-                        if deletar_evento(evento_antigo_id):
-                            # 2. Checa se o novo está livre
-                            if checar_disponibilidade(data_nova):
-                                duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                                novo_evento_id = criar_evento(nome_ia or "Cliente", servico, data_nova, duracao)
-                                save_event_id(numero_usuario, novo_evento_id) # Atualiza o ID
-                                resposta_final = f"✅ Reagendado com sucesso! {servico} alterado para {data_nova.strftime('%d/%m às %H:%M')}."
+                    if checar_disponibilidade(data_inicio):
+                        if servico:
+                            if not get_user_name(numero_usuario):
+                                resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')}. Só me diga seu nome para eu confirmar o agendamento."
                             else:
-                                resposta_final = f"❌ O horário das {data_nova.strftime('%H:%M')} está ocupado. O antigo foi cancelado. Qual outro horário prefere?"
+                                duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
+                                try:
+                                    evento_id = criar_evento(get_user_name(numero_usuario), servico, data_inicio, duracao)
+                                    save_event_id(numero_usuario, evento_id)
+                                    resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
+                                except Exception as e_cal:
+                                    print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
+                                    resposta_final = "⚠️ Problema técnico na agenda."
                         else:
-                            resposta_final = "⚠️ Tive um problema ao cancelar o agendamento antigo."
-                    except Exception as e_cal:
-                        print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
-                        resposta_final = "⚠️ Problema técnico na agenda."
-            
-            # --- CONVERSA GERAL ---
+                            resposta_final = f"✅ Sim, temos horário às {data_inicio.strftime('%H:%M')} do dia {data_inicio.strftime('%d/%m')}. Qual serviço deseja?"
+                    else:
+                        resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado. Gostaria de tentar outro horário?"
+
+            elif acao == "reagendar":
+                if not get_user_name(numero_usuario):
+                    resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
+                else:
+                    dt_novo = parse_data(intencao.get("horario_novo"))
+                    servico = intencao.get("servico", "Corte Simples")
+                    
+                    if not dt_novo:
+                        resposta_final = "❌ Não consegui entender a nova data. Pode repetir?"
+                    else:
+                        duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
+                        old_event_id = get_event_id(numero_usuario)
+                        deletou = False
+                        
+                        if old_event_id:
+                            if deletar_evento(old_event_id):
+                                deletou = True
+
+                        if not deletou:
+                            resposta_final = "Não localizei seu agendamento anterior. Vamos fazer um novo?"
+                        else:
+                            if checar_disponibilidade(dt_novo, duracao):
+                                try:
+                                    evento_id = criar_evento(get_user_name(numero_usuario), servico, dt_novo, duracao)
+                                    save_event_id(numero_usuario, evento_id)
+                                    resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi reagendado para {dt_novo.strftime('%d/%m às %H:%M')}."
+                                except Exception as e_cal:
+                                    print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
+                                    resposta_final = "⚠️ Problema técnico na agenda."
+                            else:
+                                resposta_final = f"❌ Infelizmente, o horário das {dt_novo.strftime('%H:%M')} está ocupado. O antigo foi cancelado, qual outro horário fica bom?"
+
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
+            # Envia a resposta com delay
             background_tasks.add_task(enviar_com_delay, numero_usuario, resposta_final)
 
         except Exception as e:
             print(f"Erro GLOBAL ao processar: {e}")
-            try: background_tasks.add_task(enviar_com_delay, numero_usuario, "⚠️ Ops, tive um problema interno.")
+            try: background_tasks.add_task(enviar_com_delay, numero_usuario, "⚠️ Ops, tive um problema interno. Pode repetir?")
             except: pass
             
     return {"status": "ok"}
