@@ -170,16 +170,16 @@ def deletar_eventos_por_nome(nome_cliente):
         print(f"Erro ao deletar por nome: {e}")
         return False
 
-# --- FUNÇÃO DE ENVIO ATUALIZADA PARA USAR O JID COMPLETO ---
-def enviar_whatsapp(remote_jid, texto_mensagem):
+# --- FUNÇÃO DE ENVIO BLINDADA ---
+def enviar_whatsapp(numero_destino, texto_mensagem):
     url = f"{EVOLUTION_API_URL.rstrip('/')}/message/sendText/{INSTANCE_NAME}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
     
-    # Se por algum motivo não tiver o @, adicionamos o padrão
-    if "@" not in remote_jid:
-        remote_jid = f"{remote_jid}@s.whatsapp.net"
+    # Se o número já vier com @s.whatsapp.net ou @lid, não faz nada. Se vier limpo, adiciona o @s.whatsapp.net
+    if "@" not in numero_destino:
+        numero_destino = f"{numero_destino}@s.whatsapp.net"
         
-    payload = {"number": remote_jid, "text": texto_mensagem}
+    payload = {"number": numero_destino, "text": texto_mensagem}
     
     try:
         response = requests.post(url, json=payload, headers=headers)
@@ -187,12 +187,12 @@ def enviar_whatsapp(remote_jid, texto_mensagem):
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
-async def enviar_com_delay(remote_jid, texto_mensagem):
+async def enviar_com_delay(numero_destino, texto_mensagem):
     tempo_calculado = len(texto_mensagem) * 0.08
     tempo_de_espera = min(max(tempo_calculado, 3.0), 20.0)
     print(f"⏳ Sofia está digitando... (aguardando {tempo_de_espera:.1f}s)")
     await asyncio.sleep(tempo_de_espera)
-    enviar_whatsapp(remote_jid, texto_mensagem)
+    enviar_whatsapp(numero_destino, texto_mensagem)
 
 # --- ENDPOINT DE MANUTENÇÃO ---
 @app.get("/manutencao/limpar-banco")
@@ -214,13 +214,14 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
         try:
             message_data = data["data"]
             
-            # Correção para o @lid do WhatsApp
-            remote_jid = message_data["key"]["remoteJid"]
+            # --- CORREÇÃO CRUCIAL AQUI (@lid vs @s.whatsapp.net) ---
+            # O remoteJidAlt traz o número real no formato correto
             remote_jid_alt = message_data["key"].get("remoteJidAlt")
+            remote_jid = remote_jid_alt if remote_jid_alt else message_data["key"]["remoteJid"]
             
-            # Usamos o Alt para o banco de dados (nome limpo), mas o remote_jid para enviar
-            id_para_banco = remote_jid_alt if remote_jid_alt else remote_jid
-            numero_usuario = id_para_banco.split("@")[0]
+            # Extrai o número limpo para o banco de dados
+            numero_usuario = remote_jid.split("@")[0]
+            # -------------------------------------------------------
             
             if message_data["key"].get("fromMe"): return {"status": "ok"}
 
@@ -361,13 +362,12 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
-            # AQUI ESTAVA O SEGREDO: passamos o remote_jid completo!
+            # Envia para o remote_jid completo que extraímos no início (seja @s.whatsapp.net ou @lid)
             background_tasks.add_task(enviar_com_delay, remote_jid, resposta_final)
 
         except Exception as e:
             print(f"Erro GLOBAL ao processar: {e}")
             try: 
-                # Como o remote_jid pode não estar definido se der erro no começo, usamos numero_usuario se existir
                 fallback_jid = remote_jid if 'remote_jid' in locals() else numero_usuario
                 background_tasks.add_task(enviar_com_delay, fallback_jid, "⚠️ Ops, tive um problema interno. Pode repetir?")
             except: pass
