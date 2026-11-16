@@ -204,6 +204,8 @@ async def limpar_banco_endpoint(senha: str = ""):
 
 # --- WEBHOOK PRINCIPAL ---
 @app.post("/webhook/whatsapp")
+@app.post("/webhook/whatsapp/")
+@app.post("/webhook/whatsapp/messages-upsert")
 async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
     
