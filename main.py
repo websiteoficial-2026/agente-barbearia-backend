@@ -170,14 +170,11 @@ def deletar_eventos_por_nome(nome_cliente):
         print(f"Erro ao deletar por nome: {e}")
         return False
 
-# --- FUNÇÃO DE ENVIO BLINDADA ---
+# --- FUNÇÃO DE ENVIO ---
 def enviar_whatsapp(numero_destino, texto_mensagem):
     url = f"{EVOLUTION_API_URL.rstrip('/')}/message/sendText/{INSTANCE_NAME}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
-    
-    # O numero_destino agora virá com o @lid ou @s.whatsapp.net completo
     payload = {"number": numero_destino, "text": texto_mensagem}
-    
     try:
         response = requests.post(url, json=payload, headers=headers)
         print(f"Status Evolução: {response.status_code} | Resposta da API: {response.text}")
@@ -213,13 +210,9 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
         try:
             message_data = data["data"]
             
-            # --- CORREÇÃO DEFINITIVA: JID para envio vs ID para banco de dados ---
-            jid_envio = message_data["key"]["remoteJid"] # Mantém o @lid original para o envio
-            jid_alt = message_data["key"].get("remoteJidAlt") # Pega o @s.whatsapp.net para o banco
-            
-            # Se o Alt existir, usamos ele para pegar o número limpo. Senão, limpamos o original.
+            jid_envio = message_data["key"]["remoteJid"]
+            jid_alt = message_data["key"].get("remoteJidAlt")
             numero_usuario = jid_alt.split("@")[0] if jid_alt else jid_envio.split("@")[0]
-            # -------------------------------------------------------------------
             
             if message_data["key"].get("fromMe"): return {"status": "ok"}
 
@@ -235,8 +228,9 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             nome_atual = get_user_name(numero_usuario) or "Não identificado"
             
+            # --- SUPER PROMPT: COBRINDO TODOS OS CENÁRIOS DA BARBEARIA ---
             system_prompt = f"""
-            Você é a Sofia, recepcionista da Barbearia do João. Você é educada e profissional.
+            Você é a Sofia, recepcionista da Barbearia do João. Você é educada, humana e profissional.
             Data/Hora atual: {agora}.
             Nome do cliente no sistema: {nome_atual}
             
@@ -246,19 +240,37 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             - Pagamento: Aceitamos Cartão de Crédito, Débito e Pix.
             
             REGRAS IMPORTANTES (Responda SEMPRE em formato JSON):
-            1. Se o cliente quiser MARCAR um horário novo: 
-            {{"acao": "verificar_horario", "horario": "AAAA-MM-DDTHH:MM", "servico": "Nome do Servico", "nome": "Nome do Cliente"}}
             
-            2. Se o cliente quiser MUDAR/REMARCAR um horário:
-            {{"acao": "reagendar", "horario_novo": "AAAA-MM-DDTHH:MM", "servico": "Nome do Servico", "nome": "Nome do Cliente"}}
+            1. SAUDAÇÃO / NOME:
+               - Se o nome for "Não identificado", pergunte o nome educadamente.
+               - Se o cliente informar o nome, retorne: 
+                 {{"acao": "informar_nome", "nome": "Nome do Cliente", "resposta": "Sua saudação usando o histórico para continuar o assunto"}}
             
-            3. Se for apenas conversa, dúvida sobre preços, pagamentos ou horários de funcionamento: 
-            {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
+            2. CHECAR HORÁRIO (SEM AGENDAR):
+               - Se o cliente perguntar por um horário (ex: "tem 14h?"), use a ação "checar_horario". 
+               - Se ele não citou o serviço, pergunte qual serviço ele quer antes de checar.
+                 {{"acao": "checar_horario", "horario": "AAAA-MM-DDTHH:MM", "servico": "Nome do Serviço", "nome": "Nome do Cliente"}}
             
-            4. Se o cliente PERGUNTAR se tem vaga em um dia/período (ex: "tem horário hoje?", "vocês têm amanhã?"), NÃO responda com "duvida" inventando uma resposta. Use a ação "verificar_horario" passando o horário que ele perguntou. Se ele não especificou o horário exato, use um horário padrão comercial (ex: 09:00) apenas para o sistema checar a agenda e te dar a resposta correta.
+            3. CONFIRMAR AGENDAMENTO (SÓ USAR APÓS O CLIENTE DIZER SIM):
+               - Se você já ofereceu um horário e o cliente respondeu "Sim", "Pode", "Confirmo" ou similar, use:
+                 {{"acao": "confirmar_agendamento", "horario": "AAAA-MM-DDTHH:MM", "servico": "Nome do Serviço", "nome": "Nome do Cliente"}}
             
-            ATENÇÃO CRÍTICA: Analise todo o histórico da conversa. Se o cliente já disse o serviço ou o nome em mensagens anteriores, você DEVE incluí-los no JSON atual.
-            O formato AAAA-MM-DDTHH:MM é de uso INTERNO. Fale de forma natural.
+            4. REAGENDAR (MUDAR UM HORÁRIO JÁ EXISTENTE):
+               - Se o cliente já tem um horário e pedir para mudar:
+                 {{"acao": "reagendar", "horario_novo": "AAAA-MM-DDTHH:MM", "servico": "Nome do Serviço", "nome": "Nome do Cliente"}}
+            
+            5. CANCELAR:
+               - Se o cliente pedir para desmarcar ou cancelar o horário dele:
+                 {{"acao": "cancelar", "nome": "Nome do Cliente"}}
+            
+            6. DÚVIDAS OU CONVERSAS:
+               - Para perguntas sobre preços, horários de funcionamento, pagamento ou conversa fiada:
+                 {{"acao": "duvida", "resposta": "Sua resposta humanizada aqui"}}
+            
+            ATENÇÃO CRÍTICA: 
+            - O formato AAAA-MM-DDTHH:MM é de uso INTERNO. NUNCA peça nem mostre esse formato ao cliente. 
+            - Se o cliente disser "amanhã às 14h", "sexta de manhã", converta para a data correta usando a Data/Hora atual acima.
+            - Analise o histórico da conversa. Se o cliente já disse o serviço ou o nome antes, inclua esses dados no JSON atual.
             """
 
             messages_for_api = [{"role": "system", "content": system_prompt}]
@@ -282,18 +294,24 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
             
             if not intencao or not isinstance(intencao, dict):
                 print(f"⚠️ FALHA NO JSON DA IA: {resposta_ia_raw}")
-                intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir o dia e horário?"}
+                intencao = {"acao": "duvida", "resposta": "Desculpe, me confundi. Pode repetir?"}
 
             save_message(numero_usuario, "assistant", json.dumps(intencao))
             resposta_final = ""
             acao = intencao.get("acao")
             
+            # Atualiza o nome no banco se a IA extraiu ele
             nome_ia = intencao.get("nome")
             if nome_ia and isinstance(nome_ia, str) and len(nome_ia) > 2:
                 save_user_name(numero_usuario, nome_ia)
                 nome_atual = nome_ia
 
-            if acao == "verificar_horario":
+            # --- LÓGICA 1: INFORMAR NOME ---
+            if acao == "informar_nome":
+                resposta_final = intencao.get("resposta", f"Prazer em te conhecer, {nome_atual}! Como posso ajudar?")
+
+            # --- LÓGICA 2: CHECAR HORÁRIO (APENAS CHECA, NÃO AGENDA) ---
+            elif acao == "checar_horario":
                 data_inicio = parse_data(intencao.get("horario"))
                 servico = intencao.get("servico") or "Corte Simples"
                 
@@ -302,19 +320,35 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                 else:
                     if checar_disponibilidade(data_inicio):
                         if not get_user_name(numero_usuario):
-                            resposta_final = f"✅ Temos horário às {data_inicio.strftime('%H:%M')}. Só me diga seu nome para eu confirmar o agendamento."
+                            resposta_final = f"✅ Temos horário às {data_inicio.strftime('%H:%M')}. Qual o seu nome para eu já deixar reservado?"
                         else:
-                            duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
-                            try:
-                                evento_id = criar_evento(get_user_name(numero_usuario), servico, data_inicio, duracao)
-                                save_event_id(numero_usuario, evento_id)
-                                resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
-                            except Exception as e_cal:
-                                print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
-                                resposta_final = "⚠️ Problema técnico na agenda."
+                            resposta_final = f"✅ Temos horário disponível para {servico} às {data_inicio.strftime('%d/%m às %H:%M')}. Posso confirmar o seu agendamento?"
                     else:
                         resposta_final = f"❌ Infelizmente, o horário das {data_inicio.strftime('%H:%M')} já está ocupado. Gostaria de tentar outro horário?"
 
+            # --- LÓGICA 3: CONFIRMAR AGENDAMENTO (CRIA O EVENTO) ---
+            elif acao == "confirmar_agendamento":
+                data_inicio = parse_data(intencao.get("horario"))
+                servico = intencao.get("servico") or "Corte Simples"
+                
+                if not data_inicio:
+                    resposta_final = "❌ Não consegui entender a data do agendamento. Pode repetir?"
+                elif not get_user_name(numero_usuario):
+                    resposta_final = "Só preciso do seu nome para finalizar o agendamento."
+                else:
+                    if checar_disponibilidade(data_inicio): # Checa de novo por segurança
+                        duracao = 45 if "Corte+Barba" in servico else (20 if "Barba" in servico else 30)
+                        try:
+                            evento_id = criar_evento(get_user_name(numero_usuario), servico, data_inicio, duracao)
+                            save_event_id(numero_usuario, evento_id)
+                            resposta_final = f"✅ Excelente! Seu agendamento de {servico} foi confirmado para {data_inicio.strftime('%d/%m às %H:%M')}."
+                        except Exception as e_cal:
+                            print(f"❌ ERRO NO GOOGLE CALENDAR: {e_cal}")
+                            resposta_final = "⚠️ Problema técnico na agenda."
+                    else:
+                        resposta_final = f"❌ Poxa, alguém acabou de pegar o horário das {data_inicio.strftime('%H:%M')}. Qual outro horário fica bom?"
+
+            # --- LÓGICA 4: REAGENDAR ---
             elif acao == "reagendar":
                 if not get_user_name(numero_usuario):
                     resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
@@ -357,10 +391,30 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
                             else:
                                 resposta_final = f"❌ Infelizmente, o horário das {dt_novo.strftime('%H:%M')} está ocupado. O antigo foi cancelado, qual outro horário fica bom?"
 
+            # --- LÓGICA 5: CANCELAR ---
+            elif acao == "cancelar":
+                if not get_user_name(numero_usuario):
+                    resposta_final = "Só um instante, qual é o seu nome para eu localizar seu agendamento?"
+                else:
+                    old_event_id = get_event_id(numero_usuario)
+                    deletou = False
+                    
+                    if old_event_id:
+                        if deletar_evento(old_event_id):
+                            deletou = True
+                    
+                    if not deletou:
+                        deletou = deletar_eventos_por_nome(get_user_name(numero_usuario))
+
+                    if deletou:
+                        resposta_final = "✅ Seu agendamento foi cancelado com sucesso. Se precisar remarcar, é só me avisar!"
+                    else:
+                        resposta_final = "❌ Não encontrei nenhum agendamento ativo no seu nome para cancelar."
+
+            # --- LÓGICA 6: DÚVIDAS GERAIS ---
             else:
                 resposta_final = intencao.get("resposta", "Como posso ajudar?")
 
-            # ENVIA PARA O JID ORIGINAL (O @LID)
             background_tasks.add_task(enviar_com_delay, jid_envio, resposta_final)
 
         except Exception as e:
